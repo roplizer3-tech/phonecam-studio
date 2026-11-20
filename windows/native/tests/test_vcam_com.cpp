@@ -73,7 +73,7 @@ void VerifyMfSourceDll(const std::wstring& dir) {
 
     ComPtr<IMFSampleAllocatorControl> allocCtrl;
     PC_CHECK(SUCCEEDED(srcEx.As(&allocCtrl)));
-    PC_CHECK(SUCCEEDED(allocCtrl->SetDefaultAllocator(0, nullptr)) || true);
+    PC_CHECK(allocCtrl != nullptr);
 
     if (HMODULE hSensor = LoadLibraryW(L"mfsensorgroup.dll")) {
         ComPtr<IUnknown> profCol;
@@ -123,6 +123,7 @@ void VerifyMfSourceDll(const std::wstring& dir) {
     pd.Reset();
     sd.Reset();
     handler.Reset();
+    allocCtrl.Reset();
     srcAttrs.Reset();
     streamAttrs.Reset();
     srcEx.Reset();

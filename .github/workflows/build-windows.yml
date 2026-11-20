@@ -45,7 +45,17 @@ jobs:
       - name: Configure & Build Native C++20 Engine and Virtual Cameras
         shell: pwsh
         run: |
-          cmake -S windows/native -B windows/native/build -G "Visual Studio 17 2022" -A x64 -DCMAKE_SYSTEM_VERSION="${{ steps.winsdk.outputs.version }}"
+          cmake --version
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $instVer = if (Test-Path $vswhere) { (& $vswhere -latest -property installationVersion | Select-Object -First 1) } else { "" }
+          Write-Host "Detected VS installationVersion: $instVer"
+          if ($instVer -match '^18\.') {
+            cmake -S windows/native -B windows/native/build -G "Visual Studio 18 2026" -A x64 -DCMAKE_SYSTEM_VERSION="${{ steps.winsdk.outputs.version }}"
+          } elseif ($instVer -match '^17\.') {
+            cmake -S windows/native -B windows/native/build -G "Visual Studio 17 2022" -A x64 -DCMAKE_SYSTEM_VERSION="${{ steps.winsdk.outputs.version }}"
+          } else {
+            cmake -S windows/native -B windows/native/build -A x64 -DCMAKE_SYSTEM_VERSION="${{ steps.winsdk.outputs.version }}"
+          }
           cmake --build windows/native/build --config Release --parallel
 
       - name: Run Native C++ CTest Suite (Protocol, SharedBuffer, D3D11 WARP Shaders, COM)

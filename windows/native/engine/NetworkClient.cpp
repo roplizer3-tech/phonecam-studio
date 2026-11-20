@@ -393,7 +393,7 @@ ConnectionStatus NetworkClient::GetStatus() {
 
 void NetworkClient::EnqueueVideoPacket(PacketType type, uint8_t flags, uint32_t tsMs, std::vector<uint8_t>&& payload) {
     const bool isConfig = (flags & kFlagCodecConfig) != 0;
-    const bool isKey = (flags & kFlagKeyframe) != 0;
+    const bool isKey = (flags & kFlagKeyFrame) != 0;
 
     std::lock_guard<std::mutex> lk(videoMutex_);
     if (type == PacketType::VideoH264 && !isConfig && awaitingKeyframe_ && !isKey) {

@@ -30,15 +30,22 @@ std::string WideToUtf8(const wchar_t* wstr) {
 }
 
 bool ParseBtAddr(const std::string& mac, BTH_ADDR& outAddr) {
-    unsigned int b[6]{};
-    if (std::sscanf(mac.c_str(), "%x:%x:%x:%x:%x:%x", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6 &&
-        std::sscanf(mac.c_str(), "%x-%x-%x-%x-%x-%x", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6) {
-        return false;
-    }
+    auto hexVal = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+        if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+        return -1;
+    };
     BTH_ADDR addr = 0;
-    for (int i = 0; i < 6; ++i) {
-        addr = (addr << 8) | static_cast<BTH_ADDR>(b[i] & 0xFFu);
+    int nibbles = 0;
+    for (char c : mac) {
+        if (c == ':' || c == '-') continue;
+        int v = hexVal(c);
+        if (v < 0) return false;
+        addr = (addr << 4) | static_cast<BTH_ADDR>(v);
+        ++nibbles;
     }
+    if (nibbles != 12) return false;
     outAddr = addr;
     return true;
 }

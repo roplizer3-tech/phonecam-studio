@@ -229,15 +229,39 @@ public:
     }
 
     std::string GetUsbStatusJson() {
-        UsbAdbStatus st = AdbHelper::GetUsbStatus();
+        UsbStatusSnapshot st = AdbHelper::GetUsbStatus();
+        bool devConn = !st.devices.empty();
+        bool auth = false;
+        std::string serial;
+        std::string msg;
+
+        for (const auto& d : st.devices) {
+            if (d.state == "device") {
+                auth = true;
+                serial = d.serial;
+                msg = "USB Authorized (" + serial + ")";
+                break;
+            }
+        }
+        if (!auth && !st.devices.empty()) {
+            serial = st.devices[0].serial;
+            msg = (st.devices[0].state == "unauthorized")
+                ? "USB Unauthorized: accept RSA USB Debugging popup on phone"
+                : ("USB Device state: " + st.devices[0].state);
+        } else if (!st.adbFound) {
+            msg = "adb.exe not found";
+        } else if (st.devices.empty()) {
+            msg = "No USB Android device detected";
+        }
+
         std::ostringstream oss;
         oss << "{"
             << "\"adbFound\":" << (st.adbFound ? "true" : "false") << ","
-            << "\"deviceConnected\":" << (st.deviceConnected ? "true" : "false") << ","
-            << "\"authorized\":" << (st.authorized ? "true" : "false") << ","
-            << "\"deviceCount\":" << st.deviceCount << ","
-            << "\"serial\":\"" << EscapeJson(st.serial) << "\","
-            << "\"message\":\"" << EscapeJson(st.message) << "\""
+            << "\"deviceConnected\":" << (devConn ? "true" : "false") << ","
+            << "\"authorized\":" << (auth ? "true" : "false") << ","
+            << "\"deviceCount\":" << st.devices.size() << ","
+            << "\"serial\":\"" << EscapeJson(serial) << "\","
+            << "\"message\":\"" << EscapeJson(msg) << "\""
             << "}";
         return oss.str();
     }
@@ -325,7 +349,7 @@ public:
             << "\"isUsb\":" << (st.isUsb ? "true" : "false") << ","
             << "\"isBluetooth\":" << (st.isBluetooth ? "true" : "false") << ","
             << "\"hwDecode\":" << (decoder_.IsUsingHardwareDecode() ? "true" : "false") << ","
-            << "\"aiModelsLoaded\":" << (ai_.AreModelsLoaded() ? "true" : "false") << ","
+            << "\"aiModelsLoaded\":" << (ai_.IsModelsLoaded() ? "true" : "false") << ","
             << "\"aiDirectML\":" << (ai_.IsUsingDirectML() ? "true" : "false") << ","
             << "\"remoteIp\":\"" << EscapeJson(st.remoteIp) << "\","
             << "\"deviceName\":\"" << EscapeJson(st.deviceName) << "\","

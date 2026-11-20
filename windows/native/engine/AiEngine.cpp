@@ -57,7 +57,7 @@ struct AiEngine::Impl {
         // 1. Try DirectML Hardware GPU Execution Provider first
         try {
             Ort::SessionOptions dmlOpts;
-            dmlOpts.SetExecutionMode(OrtExecutionMode::ORT_SEQUENTIAL);
+            dmlOpts.SetExecutionMode(ORT_SEQUENTIAL);
             dmlOpts.DisableMemPattern();
             dmlOpts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
 

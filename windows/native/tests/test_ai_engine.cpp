@@ -26,7 +26,7 @@ int main() {
 #if defined(PHONECAM_HAS_ONNX)
     if (!modelsDir.empty()) {
         PC_CHECK(okInit);
-        PC_CHECK(ai.AreModelsLoaded());
+        PC_CHECK(ai.IsModelsLoaded());
 
         constexpr uint32_t W = 480, H = 270;
         std::vector<uint8_t> bgra(static_cast<size_t>(W) * H * 4u, 25u);

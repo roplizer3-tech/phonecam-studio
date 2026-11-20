@@ -1,0 +1,109 @@
+name: Build Windows Studio & Virtual Camera
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'windows/**'
+      - '.github/workflows/build-windows.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'windows/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up .NET 8 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Locate Windows 11 SDK
+        id: winsdk
+        shell: pwsh
+        run: |
+          $incRoot = "C:\Program Files (x86)\Windows Kits\10\Include"
+          $sdks = Get-ChildItem $incRoot -Directory |
+            Where-Object { $_.Name -match '^10\.0\.(\d+)\.0$' -and [int]$Matches[1] -ge 22000 } |
+            Sort-Object { [version]$_.Name } -Descending
+          if (-not $sdks) {
+            throw "No Windows 11 SDK (>= 10.0.22000.0) found in $incRoot"
+          }
+          $chosen = $sdks[0].Name
+          Write-Host "Using Windows 11 SDK: $chosen"
+          "version=$chosen" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Configure & Build Native C++20 Engine and Virtual Cameras
+        shell: pwsh
+        run: |
+          cmake -S windows/native -B windows/native/build -G "Visual Studio 17 2022" -A x64 -DCMAKE_SYSTEM_VERSION="${{ steps.winsdk.outputs.version }}"
+          cmake --build windows/native/build --config Release --parallel
+
+      - name: Run Native C++ CTest Suite (Protocol, SharedBuffer, D3D11 WARP Shaders, COM)
+        shell: pwsh
+        run: ctest --test-dir windows/native/build -C Release --output-on-failure
+
+      - name: Smoke-test COM Virtual Camera Registration (regsvr32)
+        shell: pwsh
+        run: |
+          $mfDll = (Resolve-Path "windows/native/build/Release/PhoneCamMFSource.dll").Path
+          $dsDll = (Resolve-Path "windows/native/build/Release/PhoneCamDSFilter.dll").Path
+
+          $p1 = Start-Process regsvr32 -ArgumentList "/s `"$mfDll`"" -Wait -PassThru
+          if ($p1.ExitCode -ne 0) { throw "regsvr32 failed for PhoneCamMFSource.dll: $($p1.ExitCode)" }
+          if (-not (Test-Path "HKLM:\SOFTWARE\Classes\CLSID\{7A9E4B21-6C3D-4F18-9E2A-51B8C4D730F1}\InprocServer32")) {
+            throw "MF Virtual Camera CLSID missing after regsvr32"
+          }
+
+          $p2 = Start-Process regsvr32 -ArgumentList "/s `"$dsDll`"" -Wait -PassThru
+          if ($p2.ExitCode -ne 0) { throw "regsvr32 failed for PhoneCamDSFilter.dll: $($p2.ExitCode)" }
+          if (-not (Test-Path "HKLM:\SOFTWARE\Classes\CLSID\{8B1F5C32-7D4E-4A29-8F3B-62C9D5E841A2}\InprocServer32")) {
+            throw "DirectShow Filter CLSID missing after regsvr32"
+          }
+
+          Start-Process regsvr32 -ArgumentList "/u /s `"$mfDll`"" -Wait | Out-Null
+          Start-Process regsvr32 -ArgumentList "/u /s `"$dsDll`"" -Wait | Out-Null
+          Write-Host "COM regsvr32 register/unregister smoke test passed."
+
+      - name: Run .NET 8 WPF Unit Tests
+        shell: pwsh
+        run: dotnet test windows/app/PhoneCamStudio.Tests/PhoneCamStudio.Tests.csproj -c Release -p:Platform=x64
+
+      - name: Publish WPF Self-Contained x64 Bundle
+        shell: pwsh
+        run: |
+          dotnet publish windows/app/PhoneCamStudio/PhoneCamStudio.csproj -c Release -r win-x64 --self-contained true -p:Platform=x64 -o dist/PhoneCamStudio
+          Copy-Item "windows/native/build/Release/PhoneCamEngine.dll" "dist/PhoneCamStudio/"
+          Copy-Item "windows/native/build/Release/PhoneCamMFSource.dll" "dist/PhoneCamStudio/"
+          Copy-Item "windows/native/build/Release/PhoneCamDSFilter.dll" "dist/PhoneCamStudio/"
+          Copy-Item "windows/installer/Install-VirtualCam.bat" "dist/PhoneCamStudio/"
+          Copy-Item "windows/installer/Uninstall-VirtualCam.bat" "dist/PhoneCamStudio/"
+
+      - name: Build Inno Setup Installer & Portable ZIP
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { throw "ISCC.exe not found at $iscc" }
+          & $iscc /DMyAppVersion=1.0.0 windows/installer/PhoneCamStudio.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+          Compress-Archive -Path "dist/PhoneCamStudio/*" -DestinationPath "dist/PhoneCamStudio-Portable-x64.zip" -Force
+          Get-ChildItem dist/ | Format-Table Name, Length
+
+      - name: Upload Windows Installer & Portable Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-builds
+          path: |
+            dist/PhoneCamStudio-Setup-x64.exe
+            dist/PhoneCamStudio-Portable-x64.zip
+          if-no-files-found: error

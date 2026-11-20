@@ -1,0 +1,46 @@
+# Build artifacts & local caches
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
+dist/
+
+# Android / Gradle
+android/.gradle/
+android/build/
+android/app/build/
+android/.idea/
+android/*.iml
+android/local.properties
+android/captures/
+android/.cxx/
+*.apk
+*.aab
+*.ap_
+*.dex
+*.keystore
+*.jks
+
+# Windows Native C++ / CMake / MSVC
+windows/native/build/
+windows/native/out/
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.dll
+*.exe
+*.suo
+*.user
+*.sln.docstates
+.vs/
+
+# .NET / WPF
+windows/app/**/bin/
+windows/app/**/obj/
+windows/app/.vs/
+windows/installer/Output/
+
+# Verification scratch
+verify-release/

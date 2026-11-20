@@ -1,0 +1,20 @@
+# Generates GeneratedShaders.h from HLSL files so PhoneCamEngine.dll has zero runtime shader-file path dependencies.
+function(generate_shader_header OUT_HEADER SHADER_DIR)
+    file(READ "${SHADER_DIR}/fullscreen_vs.hlsl" VS_SRC)
+    file(READ "${SHADER_DIR}/pass1_geom_ps.hlsl" P1_SRC)
+    file(READ "${SHADER_DIR}/pass2_beauty_ps.hlsl" P2_SRC)
+    file(READ "${SHADER_DIR}/pass3_grade_ps.hlsl" P3_SRC)
+    file(READ "${SHADER_DIR}/pass4_nv12_ps.hlsl" P4_SRC)
+
+    set(CONTENT "#pragma once\n\nnamespace phonecam::shaders {\n\n")
+    string(APPEND CONTENT "inline constexpr const char* kFullscreenVS = R\"HLSL_SHADER(\n${VS_SRC}\n)HLSL_SHADER\";\n\n")
+    string(APPEND CONTENT "inline constexpr const char* kPass1GeomPS = R\"HLSL_SHADER(\n${P1_SRC}\n)HLSL_SHADER\";\n\n")
+    string(APPEND CONTENT "inline constexpr const char* kPass2BeautyPS = R\"HLSL_SHADER(\n${P2_SRC}\n)HLSL_SHADER\";\n\n")
+    string(APPEND CONTENT "inline constexpr const char* kPass3GradePS = R\"HLSL_SHADER(\n${P3_SRC}\n)HLSL_SHADER\";\n\n")
+    string(APPEND CONTENT "inline constexpr const char* kPass4Nv12PS = R\"HLSL_SHADER(\n${P4_SRC}\n)HLSL_SHADER\";\n\n")
+    string(APPEND CONTENT "} // namespace phonecam::shaders\n")
+
+    file(WRITE "${OUT_HEADER}.tmp" "${CONTENT}")
+    execute_process(COMMAND ${CMAKE_COMMAND} -E copy_if_different "${OUT_HEADER}.tmp" "${OUT_HEADER}")
+    file(REMOVE "${OUT_HEADER}.tmp")
+endfunction()

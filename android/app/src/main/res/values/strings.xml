@@ -1,0 +1,9 @@
+<resources>
+    <string name="app_name">PhoneCam Sender</string>
+    <string name="notif_channel_name">PhoneCam Streaming</string>
+    <string name="notif_channel_desc">Active camera stream to Windows PhoneCam Studio</string>
+    <string name="notif_title_streaming">PhoneCam Sender Active</string>
+    <string name="notif_action_stop">Stop Stream</string>
+    <string name="perm_camera_needed">Camera permission is required to stream video to Windows.</string>
+    <string name="perm_grant_button">Grant Permissions</string>
+</resources>

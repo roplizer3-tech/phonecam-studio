@@ -1,0 +1,9 @@
+<resources>
+    <string name="app_name">PhoneCam Sender</string>
+    <string name="notif_channel_name">بث PhoneCam</string>
+    <string name="notif_channel_desc">بث الكاميرا النشط إلى تطبيق PhoneCam Studio على ويندوز</string>
+    <string name="notif_title_streaming">بث PhoneCam Sender نشط</string>
+    <string name="notif_action_stop">إيقاف البث</string>
+    <string name="perm_camera_needed">مطلوب صلاحية الكاميرا لبث الفيديو إلى ويندوز.</string>
+    <string name="perm_grant_button">منح الصلاحيات</string>
+</resources>

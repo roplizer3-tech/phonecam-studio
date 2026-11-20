@@ -1,0 +1,133 @@
+name: Release PhoneCam Studio
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v1.0.0)'
+        required: true
+        default: 'v1.0.0'
+
+permissions:
+  contents: write
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+      - name: Prepare CI release keystore
+        run: |
+          keytool -genkeypair -v \
+            -keystore /tmp/phonecam-ci.keystore \
+            -alias phonecam \
+            -keyalg RSA -keysize 2048 -validity 3650 \
+            -storepass phonecamci -keypass phonecamci \
+            -dname "CN=PhoneCam Studio,O=roplizer3-tech,C=EG"
+          echo "ANDROID_KEYSTORE_PATH=/tmp/phonecam-ci.keystore" >> "$GITHUB_ENV"
+          echo "ANDROID_KEYSTORE_PASSWORD=phonecamci" >> "$GITHUB_ENV"
+          echo "ANDROID_KEY_ALIAS=phonecam" >> "$GITHUB_ENV"
+          echo "ANDROID_KEY_PASSWORD=phonecamci" >> "$GITHUB_ENV"
+      - name: Build & test Android
+        working-directory: android
+        run: gradle testDebugUnitTest lintDebug assembleDebug assembleRelease --no-daemon
+      - name: Package & Verify APKs
+        run: |
+          mkdir -p dist-android
+          cp android/app/build/outputs/apk/debug/app-debug.apk dist-android/PhoneCam-Android-debug.apk
+          cp android/app/build/outputs/apk/release/app-release.apk dist-android/PhoneCam-Android-release.apk
+          BUILD_TOOLS_DIR=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)
+          "$BUILD_TOOLS_DIR/apksigner" verify --verbose dist-android/PhoneCam-Android-release.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-apks
+          path: dist-android/*.apk
+          if-no-files-found: error
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Locate Windows 11 SDK
+        id: winsdk
+        shell: pwsh
+        run: |
+          $incRoot = "C:\Program Files (x86)\Windows Kits\10\Include"
+          $sdks = Get-ChildItem $incRoot -Directory |
+            Where-Object { $_.Name -match '^10\.0\.(\d+)\.0$' -and [int]$Matches[1] -ge 22000 } |
+            Sort-Object { [version]$_.Name } -Descending
+          if (-not $sdks) { throw "No Windows 11 SDK found" }
+          "version=$($sdks[0].Name)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+      - name: Build & test Native C++20
+        shell: pwsh
+        run: |
+          cmake -S windows/native -B windows/native/build -G "Visual Studio 17 2022" -A x64 -DCMAKE_SYSTEM_VERSION="${{ steps.winsdk.outputs.version }}"
+          cmake --build windows/native/build --config Release --parallel
+          ctest --test-dir windows/native/build -C Release --output-on-failure
+      - name: Test & Publish WPF
+        shell: pwsh
+        run: |
+          dotnet test windows/app/PhoneCamStudio.Tests/PhoneCamStudio.Tests.csproj -c Release -p:Platform=x64
+          dotnet publish windows/app/PhoneCamStudio/PhoneCamStudio.csproj -c Release -r win-x64 --self-contained true -p:Platform=x64 -o dist/PhoneCamStudio
+          Copy-Item "windows/native/build/Release/PhoneCamEngine.dll" "dist/PhoneCamStudio/"
+          Copy-Item "windows/native/build/Release/PhoneCamMFSource.dll" "dist/PhoneCamStudio/"
+          Copy-Item "windows/native/build/Release/PhoneCamDSFilter.dll" "dist/PhoneCamStudio/"
+          Copy-Item "windows/installer/Install-VirtualCam.bat" "dist/PhoneCamStudio/"
+          Copy-Item "windows/installer/Uninstall-VirtualCam.bat" "dist/PhoneCamStudio/"
+      - name: Package Installer & Portable ZIP
+        shell: pwsh
+        run: |
+          $tagVer = "${{ github.ref_name }}".TrimStart('v')
+          if ([string]::IsNullOrWhiteSpace($tagVer) -or $tagVer -eq 'main') {
+            $tagVer = "${{ inputs.tag }}".TrimStart('v')
+          }
+          if ([string]::IsNullOrWhiteSpace($tagVer)) { $tagVer = "1.0.0" }
+          choco install innosetup -y --no-progress
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DMyAppVersion=$tagVer" windows/installer/PhoneCamStudio.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
+          Compress-Archive -Path "dist/PhoneCamStudio/*" -DestinationPath "dist/PhoneCamStudio-Portable-x64.zip" -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-builds
+          path: |
+            dist/PhoneCamStudio-Setup-x64.exe
+            dist/PhoneCamStudio-Portable-x64.zip
+          if-no-files-found: error
+
+  publish-release:
+    needs: [ build-android, build-windows ]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Generate SHA256SUMS & Publish Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd release-assets
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          TAG="${{ inputs.tag }}"
+          if [ -z "$TAG" ]; then
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          gh release create "$TAG" ./* \
+            --title "PhoneCam Studio $TAG" \
+            --notes "Automated release of PhoneCam Studio (Android Sender APK + Windows 11/10 Installer & Portable x64)." \
+            --verify-tag=false || gh release upload "$TAG" ./* --clobber

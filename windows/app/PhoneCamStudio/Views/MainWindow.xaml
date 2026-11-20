@@ -1,0 +1,383 @@
+<Window x:Class="PhoneCamStudio.Views.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="PhoneCam Studio"
+        Width="1280"
+        Height="800"
+        MinWidth="1040"
+        MinHeight="680"
+        Background="#0B0F17"
+        Foreground="#F8FAFC"
+        FontFamily="Segoe UI"
+        FlowDirection="{Binding Loc.FlowDirection}"
+        WindowStartupLocation="CenterScreen">
+
+    <Window.Resources>
+        <BooleanToVisibilityConverter x:Key="BoolToVis" />
+    </Window.Resources>
+
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="62" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
+        <!-- Top Studio Bar -->
+        <Border Grid.Row="0" Background="#131926" BorderBrush="#243047" BorderThickness="0,0,0,1" Padding="18,0">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+
+                <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center">
+                    <Border Width="34" Height="34" CornerRadius="10" Background="#2563EB" Margin="0,0,10,0">
+                        <TextBlock Text="📷" FontSize="17" HorizontalAlignment="Center" VerticalAlignment="Center" />
+                    </Border>
+                    <StackPanel VerticalAlignment="Center">
+                        <TextBlock Text="{Binding Loc[AppTitle]}" FontSize="16" FontWeight="Bold" />
+                        <TextBlock Text="{Binding StatusMessage}" FontSize="11.5" Foreground="#94A3B8" />
+                    </StackPanel>
+                </StackPanel>
+
+                <!-- Virtual Cam Live Status Pill -->
+                <Border Grid.Column="1" HorizontalAlignment="Center" VerticalAlignment="Center"
+                        CornerRadius="16" Padding="14,6" Background="#1B2335" BorderBrush="#2D3B55" BorderThickness="1">
+                    <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                        <Ellipse Width="9" Height="9" Margin="0,0,8,0">
+                            <Ellipse.Style>
+                                <Style TargetType="Ellipse">
+                                    <Setter Property="Fill" Value="#64748B" />
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding IsVirtualCamActive}" Value="True">
+                                            <Setter Property="Fill" Value="#10B981" />
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </Ellipse.Style>
+                        </Ellipse>
+                        <TextBlock Text="{Binding VCamBadgeLabel}" FontSize="12.5" FontWeight="SemiBold" />
+                    </StackPanel>
+                </Border>
+
+                <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center">
+                    <Button Click="OnToggleVirtualCamClick" Margin="4,0" Padding="16,8">
+                        <Button.Style>
+                            <Style TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+                                <Setter Property="Background" Value="#2563EB" />
+                                <Setter Property="BorderBrush" Value="#3B82F6" />
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding IsVirtualCamActive}" Value="True">
+                                        <Setter Property="Background" Value="#DC2626" />
+                                        <Setter Property="BorderBrush" Value="#EF4444" />
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </Button.Style>
+                        <TextBlock Text="{Binding VCamButtonLabel}" />
+                    </Button>
+                    <Button Content="{Binding Loc[Diagnostics]}" Click="OnOpenDiagnosticsClick" Margin="4,0" />
+                    <Button Content="{Binding Loc[MinimizeTray]}" Click="OnMinimizeToTrayClick" Margin="4,0" />
+                    <Button Content="{Binding Loc.ToggleButtonLabel}" Click="OnToggleLanguageClick" Margin="4,0" MinWidth="46" />
+                </StackPanel>
+            </Grid>
+        </Border>
+
+        <!-- Main Workspace -->
+        <Grid Grid.Row="1" Margin="14">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="430" />
+            </Grid.ColumnDefinitions>
+
+            <!-- Left Preview Stage -->
+            <Grid Grid.Column="0" Margin="0,0,14,0">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+
+                <!-- Preview Quick Toolbar -->
+                <Border Grid.Row="0" Background="#131926" CornerRadius="12" Padding="10,8" Margin="0,0,0,10" BorderBrush="#243047" BorderThickness="1">
+                    <WrapPanel Orientation="Horizontal" VerticalAlignment="Center">
+                        <CheckBox IsChecked="{Binding PreviewMirrorLocal}" Content="{Binding PreviewModeLabel}" Margin="6,3" />
+                        <CheckBox IsChecked="{Binding BeforeAfterEnabled}" Content="{Binding Loc[BeforeAfter]}" Margin="10,3" />
+                        <Slider Width="110" Minimum="0.05" Maximum="0.95" Value="{Binding SplitComparePos}"
+                                Visibility="{Binding BeforeAfterEnabled, Converter={StaticResource BoolToVis}}" Margin="4,3" />
+                        <Button Content="{Binding Loc[MirrorCheck]}" Click="OnMirrorCheckClick" Margin="6,2" Padding="10,5" Background="#0F766E" BorderBrush="#14B8A6" />
+                        <CheckBox IsChecked="{Binding TestPatternMode}" Content="{Binding Loc[TestPattern]}" Margin="8,3" />
+                        <CheckBox IsChecked="{Binding BypassEffects}" Content="{Binding Loc[BypassEffects]}" Margin="8,3" />
+                    </WrapPanel>
+                </Border>
+
+                <!-- Video Surface -->
+                <Border Grid.Row="1" Background="#05070C" CornerRadius="14" BorderBrush="#243047" BorderThickness="1" ClipToBounds="True">
+                    <Grid>
+                        <Image Source="{Binding PreviewBitmap}" Stretch="Uniform" RenderOptions.BitmapScalingMode="HighQuality" />
+                        <Border VerticalAlignment="Top" HorizontalAlignment="Left" Margin="12" Padding="10,4" CornerRadius="8" Background="#AA0B0F17">
+                            <TextBlock Text="{Binding ActiveCameraBadge}" FontSize="12" Foreground="#93C5FD" FontWeight="SemiBold" />
+                        </Border>
+                    </Grid>
+                </Border>
+
+                <!-- Telemetry Footer -->
+                <Border Grid.Row="2" Background="#131926" CornerRadius="10" Padding="12,8" Margin="0,10,0,0" BorderBrush="#243047" BorderThickness="1">
+                    <DockPanel>
+                        <TextBlock Text="{Binding TelemetrySummary}" DockPanel.Dock="Left" FontWeight="SemiBold" Foreground="#CBD5E1" />
+                        <TextBlock Text="{Binding Loc[HotkeyHint]}" DockPanel.Dock="Right" HorizontalAlignment="Right" Foreground="#60A5FA" FontSize="12" />
+                    </DockPanel>
+                </Border>
+            </Grid>
+
+            <!-- Right Control Sidebar -->
+            <Border Grid.Column="1" Background="#131926" CornerRadius="14" BorderBrush="#243047" BorderThickness="1" Padding="10">
+                <TabControl>
+                    <!-- TAB 1: Connection & Remote Camera -->
+                    <TabItem Header="{Binding Loc[TabConnect]}">
+                        <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="6">
+                            <StackPanel>
+                                <TextBlock Text="{Binding Loc[DiscoveredPhones]}" FontWeight="Bold" FontSize="13.5" Margin="0,4,0,8" />
+                                <Border Background="#0E1420" CornerRadius="10" Padding="8" BorderBrush="#222E44" BorderThickness="1" MinHeight="84">
+                                    <StackPanel>
+                                        <ItemsControl ItemsSource="{Binding DiscoveredPhones}">
+                                            <ItemsControl.ItemTemplate>
+                                                <DataTemplate>
+                                                    <Border Background="#1B2335" CornerRadius="8" Padding="8" Margin="0,3">
+                                                        <DockPanel>
+                                                            <Button Content="اتصال / Connect" DockPanel.Dock="Right" Click="OnConnectDiscoveredClick" Tag="{Binding}" Padding="10,4" Background="#2563EB" />
+                                                            <TextBlock Text="{Binding DisplayLabel}" VerticalAlignment="Center" FontWeight="SemiBold" />
+                                                        </DockPanel>
+                                                    </Border>
+                                                </DataTemplate>
+                                            </ItemsControl.ItemTemplate>
+                                        </ItemsControl>
+                                        <TextBlock Text="{Binding Loc[NoPhonesYet]}" Foreground="#64748B" FontSize="12" TextWrapping="Wrap" Margin="4">
+                                            <TextBlock.Style>
+                                                <Style TargetType="TextBlock">
+                                                    <Setter Property="Visibility" Value="Collapsed" />
+                                                    <Style.Triggers>
+                                                        <DataTrigger Binding="{Binding DiscoveredPhones.Count}" Value="0">
+                                                            <Setter Property="Visibility" Value="Visible" />
+                                                        </DataTrigger>
+                                                    </Style.Triggers>
+                                                </Style>
+                                            </TextBlock.Style>
+                                        </TextBlock>
+                                    </StackPanel>
+                                </Border>
+
+                                <Button Content="{Binding Loc[ConnectUsb]}" Click="OnConnectUsbClick" Margin="0,10,0,8" Background="#059669" BorderBrush="#10B981" Padding="12,10" />
+
+                                <Grid Margin="0,4,0,8">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="90" />
+                                    </Grid.ColumnDefinitions>
+                                    <StackPanel Grid.Column="0" Margin="0,0,6,0">
+                                        <TextBlock Text="{Binding Loc[ManualIp]}" FontSize="12" Foreground="#94A3B8" Margin="0,0,0,4" />
+                                        <TextBox Text="{Binding ManualIp, UpdateSourceTrigger=PropertyChanged}" />
+                                    </StackPanel>
+                                    <StackPanel Grid.Column="1">
+                                        <TextBlock Text="{Binding Loc[PinCode]}" FontSize="12" Foreground="#94A3B8" Margin="0,0,0,4" />
+                                        <TextBox Text="{Binding PinCode, UpdateSourceTrigger=PropertyChanged}" MaxLength="8" />
+                                    </StackPanel>
+                                </Grid>
+
+                                <Grid Margin="0,0,0,14">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="*" />
+                                    </Grid.ColumnDefinitions>
+                                    <Button Grid.Column="0" Content="{Binding Loc[Connect]}" Click="OnConnectManualClick" Margin="0,0,4,0" Background="#2563EB" />
+                                    <Button Grid.Column="1" Content="{Binding Loc[Disconnect]}" Click="OnDisconnectClick" Margin="4,0,0,0" />
+                                </Grid>
+
+                                <Separator Background="#243047" Margin="0,4,0,10" />
+                                <TextBlock Text="{Binding Loc[RemotePhoneControls]}" FontWeight="Bold" FontSize="13.5" Margin="0,0,0,8" />
+
+                                <Grid Margin="0,0,0,10">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="*" />
+                                    </Grid.ColumnDefinitions>
+                                    <Button Grid.Column="0" Content="{Binding Loc[SwitchFrontBack]}" Click="OnSwitchCameraClick" Margin="0,0,4,0" Background="#1D4ED8" />
+                                    <Button Grid.Column="1" Content="{Binding Loc[ToggleTorch]}" Click="OnToggleTorchClick" Margin="4,0,0,0" />
+                                </Grid>
+
+                                <TextBlock Text="{Binding Loc[PhoneLens]}" FontSize="12" Foreground="#94A3B8" Margin="0,2,0,4" />
+                                <ComboBox ItemsSource="{Binding PhoneCameras}" SelectedItem="{Binding SelectedPhoneCamera}" Margin="0,0,0,10" Padding="6" />
+
+                                <TextBlock Text="{Binding Loc[StreamRes]}" FontSize="12" Foreground="#94A3B8" Margin="0,2,0,4" />
+                                <WrapPanel Margin="0,0,0,10">
+                                    <Button Content="480p" Click="OnSetResClick" Tag="480p" Margin="0,0,6,0" />
+                                    <Button Content="720p HD" Click="OnSetResClick" Tag="720p" Margin="0,0,6,0" />
+                                    <Button Content="1080p FHD" Click="OnSetResClick" Tag="1080p" />
+                                </WrapPanel>
+
+                                <TextBlock Text="{Binding Loc[StreamFps]}" FontSize="12" Foreground="#94A3B8" Margin="0,2,0,4" />
+                                <WrapPanel Margin="0,0,0,10">
+                                    <Button Content="30 FPS" Click="OnSetFpsClick" Tag="30" Margin="0,0,6,0" />
+                                    <Button Content="60 FPS" Click="OnSetFpsClick" Tag="60" Margin="0,0,12,0" />
+                                    <Button Content="H.264" Click="OnSetCodecClick" Tag="h264" Margin="0,0,6,0" />
+                                    <Button Content="MJPEG" Click="OnSetCodecClick" Tag="mjpeg" />
+                                </WrapPanel>
+
+                                <TextBlock Text="{Binding Loc[ZoomControl]}" FontSize="12" Foreground="#94A3B8" />
+                                <Slider Minimum="1.0" Maximum="5.0" Value="{Binding PhoneZoom}" Margin="0,4,0,10" />
+                            </StackPanel>
+                        </ScrollViewer>
+                    </TabItem>
+
+                    <!-- TAB 2: Mirror & Orientation Fix -->
+                    <TabItem Header="{Binding Loc[TabMirror]}">
+                        <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="6">
+                            <StackPanel>
+                                <TextBlock Text="{Binding Loc[PlatformProfiles]}" FontWeight="Bold" FontSize="13.5" Margin="0,4,0,8" />
+                                <UniformGrid Columns="2" Margin="0,0,0,8">
+                                    <Button Content="WhatsApp" Click="OnPlatformPresetClick" Tag="WhatsApp" Margin="3" Background="#15803D" />
+                                    <Button Content="Telegram" Click="OnPlatformPresetClick" Tag="Telegram" Margin="3" Background="#0284C7" />
+                                    <Button Content="Zoom / Meet / Teams" Click="OnPlatformPresetClick" Tag="ZoomMeetTeams" Margin="3" Background="#4F46E5" />
+                                    <Button Content="Raw / Custom" Click="OnPlatformPresetClick" Tag="RawCustom" Margin="3" />
+                                </UniformGrid>
+
+                                <Border Background="#0E1420" CornerRadius="10" Padding="10" Margin="0,2,0,12" BorderBrush="#26344D" BorderThickness="1">
+                                    <TextBlock Text="{Binding PlatformGuidance}" TextWrapping="Wrap" FontSize="12" Foreground="#CBD5E1" LineHeight="18" />
+                                </Border>
+
+                                <TextBlock Text="{Binding Loc[OutputTransform]}" FontWeight="Bold" FontSize="13.5" Margin="0,2,0,8" />
+                                <CheckBox IsChecked="{Binding OutputFlipH}" Content="{Binding Loc[FlipHorizontal]}" Margin="0,4" />
+                                <CheckBox IsChecked="{Binding OutputFlipV}" Content="{Binding Loc[FlipVertical]}" Margin="0,4" />
+                                <CheckBox IsChecked="{Binding AutoRotateFromPhone}" Content="{Binding Loc[AutoRotatePhone]}" Margin="0,4" />
+                                <CheckBox IsChecked="{Binding PerCameraMemoryEnabled}" Content="{Binding Loc[PerCameraMemory]}" Margin="0,4,0,10" />
+
+                                <WrapPanel Margin="0,0,0,12">
+                                    <Button Content="{Binding Loc[Rotate90]}" Click="OnRotate90Click" Margin="0,0,8,0" />
+                                    <Button Content="{Binding Loc[MirrorCheck]}" Click="OnMirrorCheckClick" Background="#0F766E" />
+                                </WrapPanel>
+
+                                <TextBlock Text="{Binding Loc[SmartFraming]}" FontWeight="Bold" FontSize="13" Margin="0,4,0,6" />
+                                <StackPanel Margin="0,0,0,12">
+                                    <Button Content="{Binding Loc[FrameFill]}" Click="OnFramingModeClick" Tag="0" Margin="0,3" />
+                                    <Button Content="{Binding Loc[FrameBlur]}" Click="OnFramingModeClick" Tag="1" Margin="0,3" />
+                                    <Button Content="{Binding Loc[FrameBlack]}" Click="OnFramingModeClick" Tag="2" Margin="0,3" />
+                                </StackPanel>
+
+                                <TextBlock Text="{Binding Loc[DigitalZoom]}" FontSize="12" Foreground="#94A3B8" />
+                                <Slider Minimum="1.0" Maximum="3.0" Value="{Binding DigitalZoom}" Margin="0,2,0,8" />
+                            </StackPanel>
+                        </ScrollViewer>
+                    </TabItem>
+
+                    <!-- TAB 3: Beauty & Appearance -->
+                    <TabItem Header="{Binding Loc[TabBeauty]}">
+                        <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="6">
+                            <StackPanel>
+                                <TextBlock Text="{Binding Loc[SkinSmooth]}" FontSize="12.5" Margin="0,6,0,2" />
+                                <Slider Minimum="0" Maximum="1" Value="{Binding SkinSmooth}" Margin="0,0,0,10" />
+
+                                <TextBlock Text="{Binding Loc[StudioLight]}" FontSize="12.5" Margin="0,4,0,2" />
+                                <Slider Minimum="0" Maximum="1" Value="{Binding StudioLight}" Margin="0,0,0,10" />
+
+                                <TextBlock Text="{Binding Loc[Denoise]}" FontSize="12.5" Margin="0,4,0,2" />
+                                <Slider Minimum="0" Maximum="1" Value="{Binding Denoise}" Margin="0,0,0,10" />
+
+                                <TextBlock Text="{Binding Loc[EyeClarity]}" FontSize="12.5" Margin="0,4,0,2" />
+                                <Slider Minimum="0" Maximum="1" Value="{Binding Sharpen}" Margin="0,0,0,10" />
+
+                                <TextBlock Text="{Binding Loc[SoftGlow]}" FontSize="12.5" Margin="0,4,0,2" />
+                                <Slider Minimum="0" Maximum="1" Value="{Binding SoftGlow}" Margin="0,0,0,10" />
+
+                                <TextBlock Text="{Binding Loc[AutoWB]}" FontSize="12.5" Margin="0,4,0,2" />
+                                <Slider Minimum="0" Maximum="1" Value="{Binding AutoWhiteBalance}" Margin="0,0,0,14" />
+
+                                <Button Content="{Binding Loc[ResetColors]}" Click="OnResetColorsClick" />
+                            </StackPanel>
+                        </ScrollViewer>
+                    </TabItem>
+
+                    <!-- TAB 4: Color Grading & Presets -->
+                    <TabItem Header="{Binding Loc[TabColor]}">
+                        <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="6">
+                            <StackPanel>
+                                <TextBlock Text="{Binding Loc[BuiltInPresets]}" FontWeight="Bold" FontSize="13" Margin="0,4,0,6" />
+                                <ListBox ItemsSource="{Binding Presets}" SelectedItem="{Binding SelectedPreset}"
+                                         Background="#0E1420" BorderBrush="#222E44" MaxHeight="180" Margin="0,0,0,10">
+                                    <ListBox.ItemTemplate>
+                                        <DataTemplate>
+                                            <TextBlock Text="{Binding DisplayLabel}" Foreground="#F8FAFC" Padding="4,2" />
+                                        </DataTemplate>
+                                    </ListBox.ItemTemplate>
+                                </ListBox>
+
+                                <Grid Margin="0,0,0,12">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBox Grid.Column="0" Text="{Binding NewPresetName, UpdateSourceTrigger=PropertyChanged}" Margin="0,0,4,0" />
+                                    <Button Grid.Column="1" Content="{Binding Loc[SavePreset]}" Click="OnSavePresetClick" Margin="0,0,4,0" Padding="8,5" Background="#2563EB" />
+                                    <Button Grid.Column="2" Content="{Binding Loc[DeletePreset]}" Click="OnDeletePresetClick" Padding="8,5" />
+                                </Grid>
+
+                                <TextBlock Text="{Binding Loc[Exposure]}" FontSize="12" />
+                                <Slider Minimum="-2" Maximum="2" Value="{Binding Exposure}" Margin="0,0,0,6" />
+
+                                <TextBlock Text="{Binding Loc[Brightness]}" FontSize="12" />
+                                <Slider Minimum="-0.5" Maximum="0.5" Value="{Binding Brightness}" Margin="0,0,0,6" />
+
+                                <TextBlock Text="{Binding Loc[Contrast]}" FontSize="12" />
+                                <Slider Minimum="0.5" Maximum="1.8" Value="{Binding Contrast}" Margin="0,0,0,6" />
+
+                                <TextBlock Text="{Binding Loc[Highlights]}" FontSize="12" />
+                                <Slider Minimum="-1" Maximum="1" Value="{Binding Highlights}" Margin="0,0,0,6" />
+
+                                <TextBlock Text="{Binding Loc[Shadows]}" FontSize="12" />
+                                <Slider Minimum="-1" Maximum="1" Value="{Binding Shadows}" Margin="0,0,0,6" />
+
+                                <TextBlock Text="{Binding Loc[Gamma]}" FontSize="12" />
+                                <Slider Minimum="0.6" Maximum="1.6" Value="{Binding GammaVal}" Margin="0,0,0,6" />
+
+                                <TextBlock Text="{Binding Loc[Temperature]}" FontSize="12" />
+                                <Slider Minimum="-1" Maximum="1" Value="{Binding Temperature}" Margin="0,0,0,6" />
+
+                                <TextBlock Text="{Binding Loc[Tint]}" FontSize="12" />
+                                <Slider Minimum="-1" Maximum="1" Value="{Binding Tint}" Margin="0,0,0,6" />
+
+                                <TextBlock Text="{Binding Loc[Saturation]}" FontSize="12" />
+                                <Slider Minimum="0" Maximum="2" Value="{Binding Saturation}" Margin="0,0,0,6" />
+
+                                <TextBlock Text="{Binding Loc[Vibrance]}" FontSize="12" />
+                                <Slider Minimum="-1" Maximum="1" Value="{Binding Vibrance}" Margin="0,0,0,6" />
+
+                                <TextBlock Text="{Binding Loc[Vignette]}" FontSize="12" />
+                                <Slider Minimum="0" Maximum="1" Value="{Binding Vignette}" Margin="0,0,0,10" />
+
+                                <Button Content="{Binding Loc[ResetColors]}" Click="OnResetColorsClick" Margin="0,4,0,8" />
+                            </StackPanel>
+                        </ScrollViewer>
+                    </TabItem>
+                </TabControl>
+            </Border>
+        </Grid>
+
+        <!-- Diagnostics Overlay Modal -->
+        <Grid x:Name="DiagnosticsOverlay" Grid.RowSpan="2" Background="#BB000000" Visibility="Collapsed">
+            <Border Background="#131926" CornerRadius="16" BorderBrush="#334155" BorderThickness="1"
+                    Width="560" VerticalAlignment="Center" HorizontalAlignment="Center" Padding="22">
+                <StackPanel>
+                    <TextBlock Text="{Binding Loc[DiagTitle]}" FontSize="16" FontWeight="Bold" Margin="0,0,0,12" />
+                    <Border Background="#0B0F17" CornerRadius="10" Padding="14" BorderBrush="#243047" BorderThickness="1" Margin="0,0,0,14">
+                        <TextBlock Text="{Binding DiagnosticsText}" FontFamily="Consolas" FontSize="12.5" TextWrapping="Wrap" Foreground="#E2E8F0" />
+                    </Border>
+                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                        <Button Content="{Binding Loc[ReregisterAdmin]}" Click="OnRunAdminRegClick" Background="#2563EB" Margin="0,0,10,0" />
+                        <Button Content="{Binding Loc[Close]}" Click="OnCloseDiagnosticsClick" />
+                    </StackPanel>
+                </StackPanel>
+            </Border>
+        </Grid>
+    </Grid>
+</Window>

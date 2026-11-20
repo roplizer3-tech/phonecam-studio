@@ -1,0 +1,67 @@
+name: Build Android App
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'android/**'
+      - '.github/workflows/build-android.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'android/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle 8.10.2
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+
+      - name: Prepare CI release keystore
+        run: |
+          keytool -genkeypair -v \
+            -keystore /tmp/phonecam-ci.keystore \
+            -alias phonecam \
+            -keyalg RSA -keysize 2048 -validity 3650 \
+            -storepass phonecamci -keypass phonecamci \
+            -dname "CN=PhoneCam Studio,O=roplizer3-tech,C=EG"
+          echo "ANDROID_KEYSTORE_PATH=/tmp/phonecam-ci.keystore" >> "$GITHUB_ENV"
+          echo "ANDROID_KEYSTORE_PASSWORD=phonecamci" >> "$GITHUB_ENV"
+          echo "ANDROID_KEY_ALIAS=phonecam" >> "$GITHUB_ENV"
+          echo "ANDROID_KEY_PASSWORD=phonecamci" >> "$GITHUB_ENV"
+
+      - name: Run Unit Tests, Lint, and Build APKs
+        working-directory: android
+        run: gradle testDebugUnitTest lintDebug assembleDebug assembleRelease --no-daemon
+
+      - name: Package & Verify APKs
+        run: |
+          mkdir -p dist-android
+          cp android/app/build/outputs/apk/debug/app-debug.apk dist-android/PhoneCam-Android-debug.apk
+          cp android/app/build/outputs/apk/release/app-release.apk dist-android/PhoneCam-Android-release.apk
+          BUILD_TOOLS_DIR=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)
+          "$BUILD_TOOLS_DIR/apksigner" verify --verbose dist-android/PhoneCam-Android-release.apk
+          ls -lh dist-android/
+
+      - name: Upload Android APK Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apks
+          path: dist-android/*.apk
+          if-no-files-found: error

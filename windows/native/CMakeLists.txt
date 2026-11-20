@@ -68,7 +68,6 @@ target_link_libraries(PhoneCamEngine PRIVATE
     mf
     wmcodecdspuuid
     strmiids
-    ksguid
     windowscodecs
     ws2_32
     bcrypt
@@ -91,7 +90,6 @@ target_link_libraries(PhoneCamMFSource PRIVATE
     mfplat
     mfuuid
     mf
-    ksguid
     ksuser
     strmiids
     ole32
@@ -140,6 +138,6 @@ target_link_libraries(test_gpu_pipeline PRIVATE phonecam_common d3d11 d3dcompile
 add_test(NAME GpuPipelineShaderTests COMMAND test_gpu_pipeline)
 
 add_executable(test_vcam_com tests/test_vcam_com.cpp)
-target_link_libraries(test_vcam_com PRIVATE phonecam_common mfplat mfuuid strmiids ksguid ksuser ole32)
+target_link_libraries(test_vcam_com PRIVATE phonecam_common mfplat mfuuid strmiids ksuser ole32)
 add_dependencies(test_vcam_com PhoneCamMFSource PhoneCamDSFilter)
 add_test(NAME VCamComTests COMMAND test_vcam_com)

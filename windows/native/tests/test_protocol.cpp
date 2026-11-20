@@ -1,6 +1,6 @@
+#include "TestCheck.h"
 #include "../common/Protocol.h"
 
-#include <cassert>
 #include <iostream>
 
 using namespace phonecam;
@@ -14,24 +14,24 @@ int main() {
     h.payloadSize = 1024 * 64;
     h.timestampMs = 4242;
 
-    assert(ValidateHeader(h));
-    assert(ExtractRotationDeg(h.flags) == 270);
-    assert(IsFrontCameraFlag(h.flags));
+    PC_CHECK(ValidateHeader(h));
+    PC_CHECK(ExtractRotationDeg(h.flags) == 270);
+    PC_CHECK(IsFrontCameraFlag(h.flags));
 
     // Reject bad magic
     PacketHeader badMagic = h;
     badMagic.magic = 0x12345678;
-    assert(!ValidateHeader(badMagic));
+    PC_CHECK(!ValidateHeader(badMagic));
 
     // Reject oversized payload (> 8 MiB)
     PacketHeader oversized = h;
     oversized.payloadSize = kMaxPayloadBytes + 1;
-    assert(!ValidateHeader(oversized));
+    PC_CHECK(!ValidateHeader(oversized));
 
     // Reject unknown type
     PacketHeader badType = h;
     badType.type = 99;
-    assert(!ValidateHeader(badType));
+    PC_CHECK(!ValidateHeader(badType));
 
     std::cout << "[PASS] ProtocolTests\n";
     return 0;

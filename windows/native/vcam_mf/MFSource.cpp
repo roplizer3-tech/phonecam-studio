@@ -11,6 +11,11 @@ namespace phonecam::mf {
 
 namespace {
 
+// {FB6C4281-0353-11D1-905F-0000C0CC16BA} == PINNAME_VIDEO_CAPTURE
+inline constexpr GUID kPinNameVideoCapture = {
+    0xFB6C4281u, 0x0353u, 0x11D1u, { 0x90u, 0x5Fu, 0x00u, 0x00u, 0xC0u, 0xCCu, 0x16u, 0xBAu }
+};
+
 HRESULT CreateVideoMediaType(
     const GUID& subtype,
     uint32_t width,
@@ -57,7 +62,7 @@ PhoneCamMediaStream::PhoneCamMediaStream(PhoneCamMediaSource* parent, IMFStreamD
     MFCreateAttributes(&streamAttrs_, 6);
     if (streamAttrs_) {
         streamAttrs_->SetUINT32(MF_DEVICESTREAM_STREAM_ID, 0);
-        streamAttrs_->SetGUID(MF_DEVICESTREAM_STREAM_CATEGORY, PINNAME_VIDEO_CAPTURE);
+        streamAttrs_->SetGUID(MF_DEVICESTREAM_STREAM_CATEGORY, kPinNameVideoCapture);
         streamAttrs_->SetUINT32(MF_DEVICESTREAM_FRAMESERVER_SHARED, 1);
         streamAttrs_->SetUINT32(MF_DEVICESTREAM_ATTRIBUTE_FRAMESOURCE_TYPES, MFFrameSourceTypes_Color);
     }
@@ -390,7 +395,7 @@ HRESULT PhoneCamMediaSource::Initialize() {
     if (FAILED(hr)) return hr;
 
     sd->SetUINT32(MF_DEVICESTREAM_STREAM_ID, 0);
-    sd->SetGUID(MF_DEVICESTREAM_STREAM_CATEGORY, PINNAME_VIDEO_CAPTURE);
+    sd->SetGUID(MF_DEVICESTREAM_STREAM_CATEGORY, kPinNameVideoCapture);
     sd->SetUINT32(MF_DEVICESTREAM_FRAMESERVER_SHARED, 1);
     sd->SetUINT32(MF_DEVICESTREAM_ATTRIBUTE_FRAMESOURCE_TYPES, MFFrameSourceTypes_Color);
 
@@ -493,7 +498,7 @@ IFACEMETHODIMP PhoneCamMediaSource::Start(
     PROPVARIANT var{};
     PropVariantInit(&var);
     var.vt = VT_UNKNOWN;
-    var.punkVal = stream_.Get();
+    var.punkVal = static_cast<IMFMediaStream2*>(stream_.Get());
     eventQueue_->QueueEventParamVar(streamAnnounced_ ? MEUpdatedStream : MENewStream, GUID_NULL, S_OK, &var);
     streamAnnounced_ = true;
 

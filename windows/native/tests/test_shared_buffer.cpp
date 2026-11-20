@@ -1,7 +1,7 @@
+#include "TestCheck.h"
 #include "../common/SharedFrameBuffer.h"
 
 #include <atomic>
-#include <cassert>
 #include <chrono>
 #include <iostream>
 #include <thread>
@@ -16,10 +16,10 @@ int main() {
     DeleteFileW(ringPath.c_str());
 
     SharedFrameWriter writer;
-    assert(writer.Open(ringPath));
+    PC_CHECK(writer.Open(ringPath));
 
     SharedFrameReader reader;
-    assert(reader.Open(ringPath));
+    PC_CHECK(reader.Open(ringPath));
 
     constexpr uint32_t W = 640, H = 360;
     constexpr size_t FrameBytes = W * H * 3 / 2;
@@ -34,14 +34,14 @@ int main() {
             uint32_t w = 0, h = 0, fn = 0, fd = 0;
             uint64_t seq = 0;
             if (reader.ReadLatestFrameNV12(buf, w, h, fn, fd, seq)) {
-                assert(w == W && h == H);
-                assert(buf.size() == FrameBytes);
-                assert(seq >= lastSeq);
+                PC_CHECK(w == W && h == H);
+                PC_CHECK(fn == 30 && fd == 1);
+                PC_CHECK(buf.size() == FrameBytes);
+                PC_CHECK(seq >= lastSeq);
                 lastSeq = seq;
-                // Every byte of Y plane for a written frame equals its uniform tag
                 const uint8_t tag = buf[0];
-                assert(buf[W * H - 1] == tag);
-                assert(buf[W * H / 2] == tag);
+                PC_CHECK(buf[W * H - 1] == tag);
+                PC_CHECK(buf[W * H / 2] == tag);
                 readsOk.fetch_add(1);
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -52,21 +52,21 @@ int main() {
     for (uint32_t i = 1; i <= 150; ++i) {
         const uint8_t tag = static_cast<uint8_t>((i % 200) + 20);
         std::fill(frame.begin(), frame.begin() + W * H, tag);
-        std::fill(frame.begin() + W * H, frame.end(), 128);
-        assert(writer.WriteFrameNV12(frame.data(), W, H, 30, 1));
+        std::fill(frame.begin() + W * H, frame.end(), static_cast<uint8_t>(128));
+        PC_CHECK(writer.WriteFrameNV12(frame.data(), W, H, 30, 1));
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
 
     done.store(true);
     readerThread.join();
-    assert(readsOk.load() > 0);
+    PC_CHECK(readsOk.load() > 0);
 
     // Closing writer clears heartbeat -> reader should report no live stream
     writer.Close();
     std::vector<uint8_t> stale;
     uint32_t w = 0, h = 0, fn = 0, fd = 0;
     uint64_t seq = 0;
-    assert(!reader.ReadLatestFrameNV12(stale, w, h, fn, fd, seq));
+    PC_CHECK(!reader.ReadLatestFrameNV12(stale, w, h, fn, fd, seq));
 
     reader.Close();
     DeleteFileW(ringPath.c_str());

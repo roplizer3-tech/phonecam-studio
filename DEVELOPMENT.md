@@ -16,7 +16,8 @@ gradle testDebugUnitTest lintDebug assembleDebug assembleRelease
 
 ### Windows Native C++ & Tests
 ```powershell
-cmake -S windows/native -B windows/native/build -G "Visual Studio 17 2022" -A x64 -DCMAKE_SYSTEM_VERSION=10.0.22621.0
+# Visual Studio 2026 ("Visual Studio 18 2026") or Visual Studio 2022 ("Visual Studio 17 2022")
+cmake -S windows/native -B windows/native/build -G "Visual Studio 18 2026" -A x64 -DCMAKE_SYSTEM_VERSION=10.0.26100.0
 cmake --build windows/native/build --config Release --parallel
 ctest --test-dir windows/native/build -C Release --output-on-failure
 ```

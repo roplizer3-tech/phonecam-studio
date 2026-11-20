@@ -7,4 +7,4 @@
 - [x] Step 5: Windows .NET 8 WPF Studio UI (`PhoneCamStudio`) + xUnit tests
 - [x] Step 6: Inno Setup installer & Portable registration scripts
 - [x] Step 7: GitHub Actions workflows (`build-android.yml`, `build-windows.yml`, `release.yml`)
-- [ ] Step 8: Push to `roplizer3-tech/phonecam-studio`, verify CI builds/tests, publish & verify `v1.0.0` release
+- [x] Step 8: Push to `roplizer3-tech/phonecam-studio`, verify CI builds/tests, publish & verify `v1.0.0` release

@@ -91,40 +91,62 @@ std::wstring AdbHelper::FindAdbExecutable() {
     return L"";
 }
 
-AdbResult AdbHelper::ForwardStreamPort(uint16_t localPort, uint16_t devicePort) {
-    AdbResult res;
+UsbStatusSnapshot AdbHelper::GetUsbStatus() {
+    UsbStatusSnapshot snap;
     std::wstring adb = FindAdbExecutable();
     if (adb.empty()) {
-        res.ok = false;
-        res.message = "adb.exe not found in PATH, tools\\adb, or Android SDK platform-tools. Enable USB Tethering or place adb.exe in tools\\adb.";
-        return res;
+        snap.adbFound = false;
+        return snap;
     }
+    snap.adbFound = true;
 
     std::string out;
     DWORD exitCode = 1;
     if (!RunProcessCapture(adb, L"devices", out, exitCode) || exitCode != 0) {
-        res.ok = false;
-        res.message = "Failed executing adb devices: " + out;
-        return res;
+        return snap;
     }
 
     std::istringstream iss(out);
     std::string line;
     while (std::getline(iss, line)) {
-        if (line.find("\tdevice") != std::string::npos) {
-            size_t tab = line.find('\t');
-            if (tab != std::string::npos) {
-                res.devices.push_back(line.substr(0, tab));
-            }
-        }
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+        if (line.empty() || line.rfind("List of devices", 0) == 0) continue;
+        size_t tab = line.find('\t');
+        if (tab == std::string::npos) continue;
+        UsbDeviceEntry e;
+        e.serial = line.substr(0, tab);
+        e.state = line.substr(tab + 1);
+        snap.devices.push_back(std::move(e));
+    }
+    return snap;
+}
+
+AdbResult AdbHelper::ForwardStreamPort(uint16_t localPort, uint16_t devicePort) {
+    AdbResult res;
+    UsbStatusSnapshot status = GetUsbStatus();
+    if (!status.adbFound) {
+        res.ok = false;
+        res.message = "adb.exe not found in tools\\adb or PATH.";
+        return res;
+    }
+
+    bool sawUnauthorized = false;
+    for (const auto& d : status.devices) {
+        if (d.state == "device") res.devices.push_back(d.serial);
+        else if (d.state == "unauthorized") sawUnauthorized = true;
     }
 
     if (res.devices.empty()) {
         res.ok = false;
-        res.message = "No authorized Android USB device detected. Enable USB Debugging on your phone and accept the RSA prompt.";
+        res.message = sawUnauthorized
+            ? "Android USB device is 'unauthorized'. Unlock your phone and tap 'Allow USB Debugging'."
+            : "No Android USB device detected. Connect cable and enable USB Debugging (or USB Tethering).";
         return res;
     }
 
+    std::wstring adb = FindAdbExecutable();
+    std::string out;
+    DWORD exitCode = 1;
     std::wstring fwdArgs = L"forward tcp:" + std::to_wstring(localPort) + L" tcp:" + std::to_wstring(devicePort);
     if (!RunProcessCapture(adb, fwdArgs, out, exitCode) || exitCode != 0) {
         res.ok = false;
@@ -133,7 +155,7 @@ AdbResult AdbHelper::ForwardStreamPort(uint16_t localPort, uint16_t devicePort) 
     }
 
     res.ok = true;
-    res.message = "USB ADB forward ready on 127.0.0.1:" + std::to_string(localPort);
+    res.message = "USB ADB forward active on 127.0.0.1:" + std::to_string(localPort);
     return res;
 }
 

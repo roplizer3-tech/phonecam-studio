@@ -1,11 +1,19 @@
 #include "VirtualCamManager.h"
 
 #include <mfapi.h>
+#include <mfidl.h>
 #include <sstream>
+
+using Microsoft::WRL::ComPtr;
 
 namespace phonecam {
 
 namespace {
+
+// KSCATEGORY_VIDEO_CAMERA {E5323777-F976-4F5B-9B55-B94699C46E44}
+constexpr GUID kCategoryVideoCamera = {
+    0xE5323777u, 0xF976u, 0x4F5Bu, { 0x9Bu, 0x55u, 0xB9u, 0x46u, 0x99u, 0xC4u, 0x6Eu, 0x44u }
+};
 
 using FnMFCreateVirtualCamera = HRESULT(STDAPICALLTYPE*)(
     MFVirtualCameraType,
@@ -16,6 +24,32 @@ using FnMFCreateVirtualCamera = HRESULT(STDAPICALLTYPE*)(
     const GUID*,
     ULONG,
     IMFVirtualCamera**);
+
+bool IsPhoneCamEnumeratedInMf() {
+    ComPtr<IMFAttributes> attr;
+    if (FAILED(MFCreateAttributes(&attr, 1))) return false;
+    if (FAILED(attr->SetGUID(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID))) {
+        return false;
+    }
+    IMFActivate** devices = nullptr;
+    UINT32 count = 0;
+    if (FAILED(MFEnumDeviceSources(attr.Get(), &devices, &count))) return false;
+    bool found = false;
+    for (UINT32 i = 0; i < count; ++i) {
+        if (!found && devices[i]) {
+            wchar_t name[256]{};
+            UINT32 len = 0;
+            if (SUCCEEDED(devices[i]->GetString(MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME, name, 256, &len))) {
+                if (wcsstr(name, L"PhoneCam Studio") != nullptr) {
+                    found = true;
+                }
+            }
+        }
+        if (devices[i]) devices[i]->Release();
+    }
+    CoTaskMemFree(devices);
+    return found;
+}
 
 } // namespace
 
@@ -64,20 +98,29 @@ bool VirtualCamManager::Start() {
         if (!mfStarted_ && SUCCEEDED(MFStartup(MF_VERSION, MFSTARTUP_LITE))) {
             mfStarted_ = true;
         }
+
+        // If persistent System Virtual Camera was already installed by PhoneCamVcamSetup.exe, reuse it cleanly!
+        if (IsPhoneCamEnumeratedInMf()) {
+            active_ = true;
+            activeBackend_ = "Windows 11 Persistent System Virtual Camera (PhoneCam Studio)";
+            return true;
+        }
+
+        const GUID categories[1] = { kCategoryVideoCamera };
         HRESULT hr = fnCreate(
             MFVirtualCameraType_SoftwareCameraSource,
             MFVirtualCameraLifetime_Session,
             MFVirtualCameraAccess_CurrentUser,
             L"PhoneCam Studio",
             kMfActivatorClsidStr,
-            nullptr,
-            0,
+            categories,
+            1,
             &virtualCam_);
         if (SUCCEEDED(hr) && virtualCam_) {
             hr = virtualCam_->Start(nullptr);
             if (SUCCEEDED(hr)) {
                 active_ = true;
-                activeBackend_ = "Windows 11 Media Foundation (MFCreateVirtualCamera)";
+                activeBackend_ = "Windows 11 Media Foundation (Session Virtual Camera)";
                 return true;
             }
             std::ostringstream oss;
@@ -101,9 +144,6 @@ bool VirtualCamManager::Start() {
     if (dsOk) {
         active_ = true;
         activeBackend_ = "DirectShow Virtual Camera (PhoneCam Studio (DirectShow))";
-        if (lastError_.empty()) {
-            lastError_.clear();
-        }
         return true;
     }
 

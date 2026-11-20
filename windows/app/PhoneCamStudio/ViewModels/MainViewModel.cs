@@ -26,6 +26,15 @@ public sealed class DiscoveredPhoneItem
     public string DisplayLabel => $"{DeviceName} ({Ip}) {(PinRequired ? "🔒" : "")}";
 }
 
+public sealed class BluetoothPhoneItem
+{
+    public string Address { get; set; } = "";
+    public string Name { get; set; } = "";
+    public bool Connected { get; set; }
+    public bool Authenticated { get; set; }
+    public string DisplayLabel => string.IsNullOrWhiteSpace(Name) ? Address : $"{Name} ({Address})";
+}
+
 public sealed class RemoteCameraOption
 {
     public string Id { get; set; } = "";
@@ -57,6 +66,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
     public ColorBeautySettings Color { get; private set; } = new();
 
     public ObservableCollection<DiscoveredPhoneItem> DiscoveredPhones { get; } = new();
+    public ObservableCollection<BluetoothPhoneItem> BluetoothDevices { get; } = new();
     public ObservableCollection<RemoteCameraOption> PhoneCameras { get; } = new();
     public ObservableCollection<FilterPreset> Presets { get; } = new();
 
@@ -65,14 +75,17 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
     private bool _isConnected;
     private bool _isConnecting;
     private bool _isUsb;
+    private bool _isBluetooth;
     private bool _isVirtualCamActive;
     private string _statusMessage = "جاهز";
     private string _telemetrySummary = "1280x720 • 0 FPS • 0 ms";
+    private string _usbStatusText = "ADB: جاهز للفحص";
+    private string _customBgName = "";
     private bool _frontCameraActive = true;
     private bool _torchEnabled;
     private float _phoneZoom = 1.0f;
     private string _selectedRes = "720p";
-    private int _selectedFps = 30;
+    private int _selectedFps = 60;
     private string _selectedCodec = "h264";
     private RemoteCameraOption? _selectedPhoneCamera;
 
@@ -97,6 +110,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
             _engine.SetPreviewCallback(OnNativePreviewFrame);
             PushVideoParams();
             RefreshDiagnostics();
+            RefreshUsbAndBluetooth();
         }
         else
         {
@@ -124,6 +138,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
     public bool IsConnected { get => _isConnected; private set { _isConnected = value; OnPropertyChanged(); } }
     public bool IsConnecting { get => _isConnecting; private set { _isConnecting = value; OnPropertyChanged(); } }
     public bool IsUsb { get => _isUsb; private set { _isUsb = value; OnPropertyChanged(); } }
+    public bool IsBluetooth { get => _isBluetooth; private set { _isBluetooth = value; OnPropertyChanged(); } }
     public bool IsVirtualCamActive
     {
         get => _isVirtualCamActive;
@@ -140,6 +155,9 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
 
     public string StatusMessage { get => _statusMessage; private set { _statusMessage = value; OnPropertyChanged(); } }
     public string TelemetrySummary { get => _telemetrySummary; private set { _telemetrySummary = value; OnPropertyChanged(); } }
+    public string UsbStatusText { get => _usbStatusText; private set { _usbStatusText = value; OnPropertyChanged(); } }
+    public string CustomBgName { get => _customBgName; private set { _customBgName = value; OnPropertyChanged(); } }
+
     public bool FrontCameraActive
     {
         get => _frontCameraActive;
@@ -171,7 +189,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         }
     }
 
-    public string SelectedRes { get => _selectedRes; set { _selectedRes = value; OnPropertyChanged(); PushRemoteStreamConfig(); } }
+    public string SelectedRes { get => _selectedRes; set { _selectedRes = value; OnPropertyChanged(); PushRemoteStreamConfig(); PushVideoParams(); } }
     public int SelectedFps { get => _selectedFps; set { _selectedFps = value; OnPropertyChanged(); PushRemoteStreamConfig(); PushVideoParams(); } }
     public string SelectedCodec { get => _selectedCodec; set { _selectedCodec = value; OnPropertyChanged(); PushRemoteStreamConfig(); } }
 
@@ -271,6 +289,18 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         set { _testPatternMode = value; OnPropertyChanged(); PushVideoParams(); }
     }
 
+    // AI / AR / Real Shaders & Face Sculpt properties
+    public int SelectedBgMode { get => Color.BgMode; set { Color.BgMode = Math.Clamp(value, 0, 5); OnPropertyChanged(); PushVideoParams(); } }
+    public int SelectedArFilterMode { get => Color.ArFilterMode; set { Color.ArFilterMode = Math.Clamp(value, 0, 5); OnPropertyChanged(); PushVideoParams(); } }
+    public int SelectedStyleFilterMode { get => Color.StyleFilterMode; set { Color.StyleFilterMode = Math.Clamp(value, 0, 5); OnPropertyChanged(); PushVideoParams(); } }
+    public bool AutoFrameEnabled { get => Color.AutoFrameEnabled; set { Color.AutoFrameEnabled = value; OnPropertyChanged(); PushVideoParams(); } }
+    public float BgBlurStrength { get => Color.BgBlurStrength; set { Color.BgBlurStrength = value; OnPropertyChanged(); PushVideoParams(); } }
+    public float StyleIntensity { get => Color.StyleIntensity; set { Color.StyleIntensity = value; OnPropertyChanged(); PushVideoParams(); } }
+    public float FaceSlim { get => Color.FaceSlim; set { Color.FaceSlim = value; OnPropertyChanged(); PushVideoParams(); } }
+    public float EyeEnlarge { get => Color.EyeEnlarge; set { Color.EyeEnlarge = value; OnPropertyChanged(); PushVideoParams(); } }
+    public float EyeBrighten { get => Color.EyeBrighten; set { Color.EyeBrighten = value; OnPropertyChanged(); PushVideoParams(); } }
+    public float TeethWhiten { get => Color.TeethWhiten; set { Color.TeethWhiten = value; OnPropertyChanged(); PushVideoParams(); } }
+
     // Beauty & Color properties
     public float SkinSmooth { get => Color.SkinSmooth; set { Color.SkinSmooth = value; OnPropertyChanged(); PushVideoParams(); } }
     public float Denoise { get => Color.Denoise; set { Color.Denoise = value; OnPropertyChanged(); PushVideoParams(); } }
@@ -324,6 +354,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
 
     public void ConnectUsb()
     {
+        RefreshUsbStatus();
         if (_engine.ConnectUsb(PinCode.Trim()))
         {
             StatusMessage = Loc.IsArabic ? "جاري الاتصال عبر كابل USB..." : "Connecting via USB ADB...";
@@ -331,6 +362,82 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         else
         {
             PollEngineState();
+        }
+    }
+
+    public void ConnectBluetooth(string btAddr)
+    {
+        if (string.IsNullOrWhiteSpace(btAddr)) return;
+        if (_engine.ConnectBluetooth(btAddr.Trim(), PinCode.Trim()))
+        {
+            StatusMessage = Loc.IsArabic ? $"جاري الاتصال بلوتوث بـ {btAddr}..." : $"Connecting Bluetooth {btAddr}...";
+        }
+        else
+        {
+            PollEngineState();
+        }
+    }
+
+    public void RefreshUsbAndBluetooth()
+    {
+        RefreshUsbStatus();
+        RefreshBluetoothDevices();
+    }
+
+    public void RefreshUsbStatus()
+    {
+        if (!_engine.IsNativeLoaded) return;
+        try
+        {
+            using var doc = JsonDocument.Parse(_engine.GetUsbStatusJson());
+            var r = doc.RootElement;
+            bool adb = r.TryGetProperty("adbFound", out var a) && a.GetBoolean();
+            bool dev = r.TryGetProperty("deviceConnected", out var d) && d.GetBoolean();
+            bool auth = r.TryGetProperty("authorized", out var u) && u.GetBoolean();
+            string msg = r.TryGetProperty("message", out var m) ? (m.GetString() ?? "") : "";
+            string serial = r.TryGetProperty("serial", out var s) ? (s.GetString() ?? "") : "";
+
+            if (!adb)
+                UsbStatusText = Loc.IsArabic ? "ADB غير متوفر" : "ADB not found";
+            else if (dev && auth)
+                UsbStatusText = Loc.IsArabic ? $"USB متصل ومصرح ({serial})" : $"USB Authorized ({serial})";
+            else if (dev)
+                UsbStatusText = Loc.IsArabic ? "USB متصل — اقبل رسالة USB Debugging على الموبايل!" : "USB Unauthorized — accept prompt on phone!";
+            else
+                UsbStatusText = string.IsNullOrWhiteSpace(msg)
+                    ? (Loc.IsArabic ? "لا يوجد موبايل متصل بكابل USB" : "No USB Android device detected")
+                    : msg;
+        }
+        catch { }
+    }
+
+    public void RefreshBluetoothDevices()
+    {
+        if (!_engine.IsNativeLoaded) return;
+        try
+        {
+            var json = _engine.GetBluetoothDevicesJson();
+            var list = JsonSerializer.Deserialize<BluetoothPhoneItem[]>(json, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+            BluetoothDevices.Clear();
+            if (list != null)
+            {
+                foreach (var b in list) BluetoothDevices.Add(b);
+            }
+        }
+        catch { }
+    }
+
+    public void SetCustomBackgroundFile(string filePath)
+    {
+        if (string.IsNullOrWhiteSpace(filePath)) return;
+        if (_engine.SetCustomBackgroundPath(filePath))
+        {
+            CustomBgName = Path.GetFileName(filePath);
+            SelectedBgMode = 5;
+        }
+        else
+        {
+            StatusMessage = Loc.IsArabic ? "تعذر تحميل صورة الخلفية المحددة" : "Failed loading background image";
         }
     }
 
@@ -356,8 +463,8 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
             if (!ok)
             {
                 StatusMessage = Loc.IsArabic
-                    ? "تعذر تشغيل الكاميرا الافتراضية — راجع نافذة التشخيص لتسجيل DLL كمسؤول."
-                    : "Virtual camera failed to start — open Diagnostics to register COM DLLs as Admin.";
+                    ? "تعذر تشغيل الكاميرا الافتراضية — راجع نافذة التشخيص لتسجيل النظام كمسؤول."
+                    : "Virtual camera failed to start — open Diagnostics to register System Virtual Camera.";
             }
         }
     }
@@ -458,7 +565,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
             string err = r.TryGetProperty("lastError", out var p8) ? (p8.GetString() ?? "") : "";
 
             DiagnosticsText =
-                $"OS Build: {(win11 ? "Windows 11+ (MF Virtual Camera Supported)" : "Windows 10 / Legacy (DirectShow Mode)")}\n" +
+                $"OS Build: {(win11 ? "Windows 11+ (System & FrameServer MF Virtual Camera Supported)" : "Windows 10 / Legacy (DirectShow Mode)")}\n" +
                 $"MFCreateVirtualCamera API: {(mfApi ? "Available" : "Unavailable")}\n" +
                 $"PhoneCamMFSource.dll COM (HKLM): {(mfReg ? "Registered ✓" : "NOT Registered ✗")}\n" +
                 $"PhoneCamDSFilter.dll COM (HKLM): {(dsReg ? "Registered ✓" : "NOT Registered ✗")}\n" +
@@ -493,10 +600,11 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
             {
                 string mfDll = Path.Combine(baseDir, "PhoneCamMFSource.dll");
                 string dsDll = Path.Combine(baseDir, "PhoneCamDSFilter.dll");
+                string vcamSetup = Path.Combine(baseDir, "PhoneCamVcamSetup.exe");
                 Process.Start(new ProcessStartInfo
                 {
                     FileName = "cmd.exe",
-                    Arguments = $"/c regsvr32 /s \"{mfDll}\" & regsvr32 /s \"{dsDll}\"",
+                    Arguments = $"/c regsvr32 /s \"{mfDll}\" & regsvr32 /s \"{dsDll}\" & \"{vcamSetup}\" --install",
                     UseShellExecute = true,
                     Verb = "runas"
                 })?.WaitForExit(15000);
@@ -525,7 +633,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
             "1080p" => (1920, 1080),
             _ => (1280, 720)
         };
-        int bitrate = SelectedRes switch
+        int bitrate = IsBluetooth ? 850_000 : SelectedRes switch
         {
             "480p" => 2_500_000,
             "1080p" => 8_000_000,
@@ -557,6 +665,11 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
             MirrorCheckOverlay = MirrorCheckActive ? 1 : 0,
             BypassEffects = BypassEffects ? 1 : 0,
             TestPatternMode = TestPatternMode ? 1 : 0,
+            BgMode = Color.BgMode,
+            ArFilterMode = Color.ArFilterMode,
+            StyleFilterMode = Color.StyleFilterMode,
+            AutoFrameEnabled = Color.AutoFrameEnabled ? 1 : 0,
+
             Zoom = t.Zoom,
             PanX = t.PanX,
             PanY = t.PanY,
@@ -577,7 +690,13 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
             SoftGlow = Color.SoftGlow,
             Vignette = Color.Vignette,
             AutoWhiteBalance = Color.AutoWhiteBalance,
-            SplitComparePos = BeforeAfterEnabled ? SplitComparePos : -1.0f
+            SplitComparePos = BeforeAfterEnabled ? SplitComparePos : -1.0f,
+            BgBlurStrength = Color.BgBlurStrength,
+            FaceSlim = Color.FaceSlim,
+            EyeEnlarge = Color.EyeEnlarge,
+            EyeBrighten = Color.EyeBrighten,
+            TeethWhiten = Color.TeethWhiten,
+            StyleIntensity = Color.StyleIntensity
         };
         _engine.SetVideoParams(vp);
     }
@@ -586,7 +705,6 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
     {
         if (!_engine.IsNativeLoaded) return;
 
-        // 1. Refresh discovered phones
         try
         {
             var discJson = _engine.GetDiscoveredDevicesJson();
@@ -599,7 +717,6 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         }
         catch { }
 
-        // 2. Refresh connection & telemetry status
         try
         {
             using var doc = JsonDocument.Parse(_engine.GetStatusJson());
@@ -608,6 +725,10 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
             bool connecting = r.TryGetProperty("connecting", out var cgEl) && cgEl.GetBoolean();
             bool auth = r.TryGetProperty("authenticated", out var aEl) && aEl.GetBoolean();
             bool usb = r.TryGetProperty("isUsb", out var uEl) && uEl.GetBoolean();
+            bool bt = r.TryGetProperty("isBluetooth", out var bEl) && bEl.GetBoolean();
+            bool hwDec = r.TryGetProperty("hwDecode", out var hwEl) && hwEl.GetBoolean();
+            bool aiLoaded = r.TryGetProperty("aiModelsLoaded", out var aiEl) && aiEl.GetBoolean();
+            bool aiDml = r.TryGetProperty("aiDirectML", out var dmlEl) && dmlEl.GetBoolean();
             double fps = r.TryGetProperty("rxFps", out var fEl) ? fEl.GetDouble() : 0.0;
             double lat = r.TryGetProperty("latencyMs", out var lEl) ? lEl.GetDouble() : 0.0;
             string devName = r.TryGetProperty("deviceName", out var dEl) ? (dEl.GetString() ?? "") : "";
@@ -617,6 +738,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
             IsConnected = conn;
             IsConnecting = connecting;
             IsUsb = usb;
+            IsBluetooth = bt;
             FrontCameraActive = front;
 
             if (!string.IsNullOrEmpty(err))
@@ -625,7 +747,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
             }
             else if (conn && auth)
             {
-                string mode = usb ? "USB" : "Wi-Fi";
+                string mode = usb ? "USB" : (bt ? "Bluetooth" : "Wi-Fi");
                 StatusMessage = Loc.IsArabic
                     ? $"متصل ({mode}): {devName}"
                     : $"Connected ({mode}): {devName}";
@@ -639,7 +761,9 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
                 StatusMessage = Loc.IsArabic ? "في انتظار اتصال الموبايل" : "Waiting for phone connection";
             }
 
-            TelemetrySummary = $"{(SelectedRes == "1080p" ? "1920x1080" : "1280x720")} • {fps:0.0} FPS • {lat:0} ms";
+            string hwTag = hwDec ? "DXVA" : "SW";
+            string aiTag = aiLoaded ? (aiDml ? "AI:DirectML" : "AI:CPU") : "AI:Off";
+            TelemetrySummary = $"{(SelectedRes == "1080p" ? "1920x1080" : "1280x720")} • {fps:0.0} FPS • {lat:0} ms • {hwTag} • {aiTag}";
 
             if (r.TryGetProperty("cameras", out var camsEl) && camsEl.ValueKind == JsonValueKind.Array && PhoneCameras.Count != camsEl.GetArrayLength())
             {
@@ -716,6 +840,17 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
 
     private void NotifyColorProperties()
     {
+        OnPropertyChanged(nameof(SelectedBgMode));
+        OnPropertyChanged(nameof(SelectedArFilterMode));
+        OnPropertyChanged(nameof(SelectedStyleFilterMode));
+        OnPropertyChanged(nameof(AutoFrameEnabled));
+        OnPropertyChanged(nameof(BgBlurStrength));
+        OnPropertyChanged(nameof(StyleIntensity));
+        OnPropertyChanged(nameof(FaceSlim));
+        OnPropertyChanged(nameof(EyeEnlarge));
+        OnPropertyChanged(nameof(EyeBrighten));
+        OnPropertyChanged(nameof(TeethWhiten));
+
         OnPropertyChanged(nameof(SkinSmooth));
         OnPropertyChanged(nameof(Denoise));
         OnPropertyChanged(nameof(StudioLight));

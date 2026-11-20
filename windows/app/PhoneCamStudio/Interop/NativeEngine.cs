@@ -20,6 +20,12 @@ public struct PC_VideoParams
     public int BypassEffects;
     public int TestPatternMode;
 
+    // v2.0 AI Background / AR Face Filter / Stylized Shader / Center Stage
+    public int BgMode;
+    public int ArFilterMode;
+    public int StyleFilterMode;
+    public int AutoFrameEnabled;
+
     public float Zoom;
     public float PanX;
     public float PanY;
@@ -41,6 +47,14 @@ public struct PC_VideoParams
     public float Vignette;
     public float AutoWhiteBalance;
     public float SplitComparePos;
+
+    // v2.0 AI & Beauty Warp floats
+    public float BgBlurStrength;
+    public float FaceSlim;
+    public float EyeEnlarge;
+    public float EyeBrighten;
+    public float TeethWhiten;
+    public float StyleIntensity;
 }
 
 [UnmanagedFunctionPointer(CallingConvention.StdCall)]
@@ -65,25 +79,50 @@ internal static class NativeMethods
     internal static extern int pc_start_discovery(IntPtr handle);
 
     [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
-    internal static extern int pc_get_discovered_devices_json(IntPtr handle, StringBuilder outBuf, int bufSize);
+    internal static extern int pc_get_discovered_devices_json(IntPtr handle, byte[] outBuf, int bufSize);
 
-    [DllImport(DllName, CallingConvention = CallingConvention.StdCall, CharSet = CharSet.Ansi)]
-    internal static extern int pc_connect(IntPtr handle, string ipUtf8, int port, string pinUtf8);
+    [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
+    internal static extern int pc_connect(
+        IntPtr handle,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string ipUtf8,
+        int port,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string pinUtf8);
 
-    [DllImport(DllName, CallingConvention = CallingConvention.StdCall, CharSet = CharSet.Ansi)]
-    internal static extern int pc_connect_usb(IntPtr handle, string pinUtf8);
+    [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
+    internal static extern int pc_connect_usb(
+        IntPtr handle,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string pinUtf8);
+
+    [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
+    internal static extern int pc_get_usb_status_json(IntPtr handle, byte[] outBuf, int bufSize);
+
+    [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
+    internal static extern int pc_get_bluetooth_devices_json(IntPtr handle, byte[] outBuf, int bufSize);
+
+    [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
+    internal static extern int pc_connect_bluetooth(
+        IntPtr handle,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string btAddrUtf8,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string pinUtf8);
 
     [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
     internal static extern void pc_disconnect(IntPtr handle);
 
     [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
-    internal static extern int pc_get_status_json(IntPtr handle, StringBuilder outBuf, int bufSize);
+    internal static extern int pc_get_status_json(IntPtr handle, byte[] outBuf, int bufSize);
 
-    [DllImport(DllName, CallingConvention = CallingConvention.StdCall, CharSet = CharSet.Ansi)]
-    internal static extern int pc_send_control_json(IntPtr handle, string jsonUtf8);
+    [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
+    internal static extern int pc_send_control_json(
+        IntPtr handle,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string jsonUtf8);
 
     [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
     internal static extern void pc_set_video_params(IntPtr handle, ref PC_VideoParams param);
+
+    [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
+    internal static extern int pc_set_custom_background_path(
+        IntPtr handle,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string utf8Path);
 
     [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
     internal static extern int pc_start_virtual_cam(IntPtr handle);
@@ -92,7 +131,7 @@ internal static class NativeMethods
     internal static extern void pc_stop_virtual_cam(IntPtr handle);
 
     [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
-    internal static extern int pc_get_vcam_diagnostics_json(IntPtr handle, StringBuilder outBuf, int bufSize);
+    internal static extern int pc_get_vcam_diagnostics_json(IntPtr handle, byte[] outBuf, int bufSize);
 
     [DllImport(DllName, CallingConvention = CallingConvention.StdCall)]
     internal static extern void pc_set_preview_callback(IntPtr handle, PreviewFrameCallback? cb, IntPtr userData);
@@ -122,16 +161,22 @@ public sealed class EngineSession : IDisposable
         }
     }
 
+    private static string ReadUtf8Json(Func<byte[], int, int> reader, int capacity, string fallback)
+    {
+        var buf = new byte[capacity];
+        int len = reader(buf, buf.Length);
+        if (len <= 0) return fallback;
+        len = Math.Min(len, buf.Length);
+        return Encoding.UTF8.GetString(buf, 0, len);
+    }
+
     public bool StartDiscovery() =>
         _handle != IntPtr.Zero && NativeMethods.pc_start_discovery(_handle) != 0;
 
-    public string GetDiscoveredDevicesJson()
-    {
-        if (_handle == IntPtr.Zero) return "[]";
-        var sb = new StringBuilder(8192);
-        NativeMethods.pc_get_discovered_devices_json(_handle, sb, sb.Capacity);
-        return sb.ToString();
-    }
+    public string GetDiscoveredDevicesJson() =>
+        _handle == IntPtr.Zero
+            ? "[]"
+            : ReadUtf8Json((b, c) => NativeMethods.pc_get_discovered_devices_json(_handle, b, c), 8192, "[]");
 
     public bool Connect(string ip, int port, string pin) =>
         _handle != IntPtr.Zero && NativeMethods.pc_connect(_handle, ip, port, pin) != 0;
@@ -139,18 +184,28 @@ public sealed class EngineSession : IDisposable
     public bool ConnectUsb(string pin) =>
         _handle != IntPtr.Zero && NativeMethods.pc_connect_usb(_handle, pin) != 0;
 
+    public string GetUsbStatusJson() =>
+        _handle == IntPtr.Zero
+            ? "{}"
+            : ReadUtf8Json((b, c) => NativeMethods.pc_get_usb_status_json(_handle, b, c), 2048, "{}");
+
+    public string GetBluetoothDevicesJson() =>
+        _handle == IntPtr.Zero
+            ? "[]"
+            : ReadUtf8Json((b, c) => NativeMethods.pc_get_bluetooth_devices_json(_handle, b, c), 8192, "[]");
+
+    public bool ConnectBluetooth(string btAddr, string pin) =>
+        _handle != IntPtr.Zero && NativeMethods.pc_connect_bluetooth(_handle, btAddr, pin) != 0;
+
     public void Disconnect()
     {
         if (_handle != IntPtr.Zero) NativeMethods.pc_disconnect(_handle);
     }
 
-    public string GetStatusJson()
-    {
-        if (_handle == IntPtr.Zero) return "{}";
-        var sb = new StringBuilder(8192);
-        NativeMethods.pc_get_status_json(_handle, sb, sb.Capacity);
-        return sb.ToString();
-    }
+    public string GetStatusJson() =>
+        _handle == IntPtr.Zero
+            ? "{}"
+            : ReadUtf8Json((b, c) => NativeMethods.pc_get_status_json(_handle, b, c), 8192, "{}");
 
     public bool SendControlJson(string json) =>
         _handle != IntPtr.Zero && NativeMethods.pc_send_control_json(_handle, json) != 0;
@@ -160,6 +215,9 @@ public sealed class EngineSession : IDisposable
         if (_handle != IntPtr.Zero) NativeMethods.pc_set_video_params(_handle, ref p);
     }
 
+    public bool SetCustomBackgroundPath(string path) =>
+        _handle != IntPtr.Zero && NativeMethods.pc_set_custom_background_path(_handle, path) != 0;
+
     public bool StartVirtualCam() =>
         _handle != IntPtr.Zero && NativeMethods.pc_start_virtual_cam(_handle) != 0;
 
@@ -168,13 +226,10 @@ public sealed class EngineSession : IDisposable
         if (_handle != IntPtr.Zero) NativeMethods.pc_stop_virtual_cam(_handle);
     }
 
-    public string GetVCamDiagnosticsJson()
-    {
-        if (_handle == IntPtr.Zero) return "{}";
-        var sb = new StringBuilder(4096);
-        NativeMethods.pc_get_vcam_diagnostics_json(_handle, sb, sb.Capacity);
-        return sb.ToString();
-    }
+    public string GetVCamDiagnosticsJson() =>
+        _handle == IntPtr.Zero
+            ? "{}"
+            : ReadUtf8Json((b, c) => NativeMethods.pc_get_vcam_diagnostics_json(_handle, b, c), 4096, "{}");
 
     public void SetPreviewCallback(PreviewFrameCallback? cb)
     {

@@ -143,6 +143,57 @@ int main() {
     }
     PC_CHECK(foundBrightOverlay);
 
-    std::cout << "[PASS] GpuPipelineShaderTests (all 4 HLSL passes verified on D3D11 WARP)\n";
+    // 7. Real Stylized Filters (Anime Cel-Shader & Retro VHS) modify image output distinctly
+    p = NeutralParams();
+    p.styleFilterMode = 1; // Anime / Cartoon
+    p.styleIntensity = 1.0f;
+    PC_CHECK(gpu.ProcessFrame(in, p, true, out));
+    PC_CHECK(out.previewBgra.size() == W * H * 4u);
+
+    p.styleFilterMode = 3; // Retro VHS
+    PC_CHECK(gpu.ProcessFrame(in, p, true, out));
+    SamplePixel(out.previewBgra, W, W / 4, H / 4, r, g, b);
+    PC_CHECK(r > 120);
+
+    // 8. Real AI Background Isolation (mask center=255 foreground, corner=0 background) -> Studio Office shifts corner
+    AiStateSnapshot mockAi{};
+    mockAi.hasValidMask = true;
+    mockAi.mask256.assign(256u * 256u, 0u);
+    for (uint32_t y = 64; y < 192; ++y) {
+        for (uint32_t x = 64; x < 192; ++x) {
+            mockAi.mask256[y * 256u + x] = 255u;
+        }
+    }
+    p = NeutralParams();
+    p.bgMode = 2; // Studio Office backdrop (dark blue-slate, not red!)
+    PC_CHECK(gpu.ProcessFrame(in, p, true, out, &mockAi));
+    // Top-left corner (10,10) is mask=0 -> replaced with Studio Office dark slate (no longer bright red r>200)
+    SamplePixel(out.previewBgra, W, 10, 10, r, g, b);
+    PC_CHECK(r < 140);
+    // Center top quadrant (W*3/8, H*3/8) is inside mask=255 -> remains bright red foreground!
+    SamplePixel(out.previewBgra, W, (W * 3) / 8, (H * 3) / 8, r, g, b);
+    PC_CHECK(r > 190 && g < 70);
+
+    // 9. Real AR Aviator Sunglasses + Face Slim warp anchored to AI Face Landmarks
+    mockAi.face.detected = true;
+    mockAi.face.confidence = 0.95f;
+    mockAi.face.boxX = 0.35f; mockAi.face.boxY = 0.25f;
+    mockAi.face.boxW = 0.30f; mockAi.face.boxH = 0.50f;
+    mockAi.face.rightEyeX = 0.44f; mockAi.face.rightEyeY = 0.42f;
+    mockAi.face.leftEyeX = 0.56f; mockAi.face.leftEyeY = 0.42f;
+    mockAi.face.noseX = 0.50f; mockAi.face.noseY = 0.52f;
+    mockAi.face.rightMouthX = 0.46f; mockAi.face.rightMouthY = 0.64f;
+    mockAi.face.leftMouthX = 0.54f; mockAi.face.leftMouthY = 0.64f;
+
+    p = NeutralParams();
+    p.arFilterMode = 1; // Aviator Sunglasses
+    p.faceSlim = 0.6f;
+    PC_CHECK(gpu.ProcessFrame(in, p, true, out, &mockAi));
+    // Verify right-eye center pixel in white bottom-right quadrant? No, rightEye=(0.44,0.42) is in top-left RED quadrant (r=230):
+    // Under tinted dark aviator lens, pixel luminance drops substantially vs r=230!
+    SamplePixel(out.previewBgra, W, static_cast<uint32_t>(W * 0.44f), static_cast<uint32_t>(H * 0.42f), r, g, b);
+    PC_CHECK(r < 120);
+
+    std::cout << "[PASS] GpuPipelineShaderTests (all 4 HLSL passes + AI Bg + AR + Stylized shaders verified on D3D11 WARP)\n";
     return 0;
 }

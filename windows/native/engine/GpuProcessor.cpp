@@ -2,7 +2,11 @@
 #include "GeneratedShaders.h"
 
 #include <d3dcompiler.h>
+#include <objbase.h>
+#include <wincodec.h>
+
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 
 using Microsoft::WRL::ComPtr;
@@ -10,6 +14,9 @@ using Microsoft::WRL::ComPtr;
 namespace phonecam {
 
 namespace {
+
+constexpr uint32_t kAiExtractW = 480;
+constexpr uint32_t kAiExtractH = 270;
 
 struct alignas(16) GeomCBData {
     float srcWidth;
@@ -32,9 +39,17 @@ struct alignas(16) BeautyCBData {
     float skinSmooth;
     float denoise;
     float studioLight;
+    float faceSlim;
+    float eyeEnlarge;
+    float faceDetected;
+    float faceCenterX;
+    float faceCenterY;
+    float faceScale;
     float pad0;
-    float pad1;
-    float pad2;
+    float rightEyeX;
+    float rightEyeY;
+    float leftEyeX;
+    float leftEyeY;
 };
 
 struct alignas(16) GradeCBData {
@@ -42,31 +57,66 @@ struct alignas(16) GradeCBData {
     float texHeight;
     float exposure;
     float brightness;
+
     float contrast;
     float highlights;
     float shadows;
     float gammaVal;
+
     float temperature;
     float tint;
     float saturation;
     float vibrance;
+
     float sharpen;
     float softGlow;
     float vignette;
     float awbStrength;
+
     float awbGainR;
     float awbGainG;
     float awbGainB;
     float mirrorCheck;
+
     float isPreview;
     float splitPos;
     float bypassAll;
     float previewFlipH;
+
+    int32_t bgMode;
+    int32_t arFilterMode;
+    int32_t styleFilterMode;
+    float bgBlurStrength;
+
+    float eyeBrighten;
+    float teethWhiten;
+    float styleIntensity;
+    float timeSec;
+
+    float hasCustomBg;
+    float hasAiMask;
+    float faceDetected;
+    float faceConf;
+
+    float rightEyeX;
+    float rightEyeY;
+    float leftEyeX;
+    float leftEyeY;
+
+    float noseX;
+    float noseY;
+    float mouthCenterX;
+    float mouthCenterY;
+
+    float faceBoxX;
+    float faceBoxY;
+    float faceBoxW;
+    float faceBoxH;
 };
 
 static_assert(sizeof(GeomCBData) == 48, "GeomCBData size mismatch");
-static_assert(sizeof(BeautyCBData) == 32, "BeautyCBData size mismatch");
-static_assert(sizeof(GradeCBData) == 96, "GradeCBData size mismatch");
+static_assert(sizeof(BeautyCBData) == 64, "BeautyCBData size mismatch");
+static_assert(sizeof(GradeCBData) == 192, "GradeCBData size mismatch");
 
 bool CompileShaderFromMemory(
     const char* source,
@@ -152,10 +202,24 @@ bool CreateStagingTex(ID3D11Device* dev, UINT w, UINT h, DXGI_FORMAT fmt, ComPtr
     return SUCCEEDED(dev->CreateTexture2D(&td, nullptr, &outTex));
 }
 
+std::wstring Utf8ToWide(const std::string& utf8) {
+    if (utf8.empty()) return {};
+    int needed = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), -1, nullptr, 0);
+    if (needed <= 1) return {};
+    std::wstring out(static_cast<size_t>(needed - 1), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), -1, out.data(), needed);
+    return out;
+}
+
 } // namespace
 
 GpuProcessor::~GpuProcessor() {
     Shutdown();
+}
+
+void GpuProcessor::SetAiEngine(AiEngine* aiEngine) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    aiEngine_ = aiEngine;
 }
 
 bool GpuProcessor::Initialize(bool forceWarp) {
@@ -220,26 +284,44 @@ bool GpuProcessor::Initialize(bool forceWarp) {
         return false;
     }
 
-    if (!CompileShaders()) {
+    if (!CompileShaders() || !EnsureAiResources()) {
         Shutdown();
         return false;
     }
 
+    startTime_ = std::chrono::steady_clock::now();
     return true;
 }
 
 void GpuProcessor::Shutdown() {
     srcTexW_ = srcTexH_ = 0;
     outTexW_ = outTexH_ = 0;
+    previewW_ = previewH_ = 0;
+    stagingIdx_ = 0;
+    aiStagingIdx_ = 0;
+    aiRingWarmed_ = false;
+    hasCustomBg_ = false;
+    autoZoom_ = 1.0f;
+    autoPanX_ = 0.0f;
+    autoPanY_ = 0.0f;
+
     srcYSrv_.Reset(); srcYTex_.Reset();
     srcUVSrv_.Reset(); srcUVTex_.Reset();
     srcBgraSrv_.Reset(); srcBgraTex_.Reset();
     rtGeomSrv_.Reset(); rtGeomRtv_.Reset(); rtGeomTex_.Reset();
     rtBeautySrv_.Reset(); rtBeautyRtv_.Reset(); rtBeautyTex_.Reset();
     rtGradeOutSrv_.Reset(); rtGradeOutRtv_.Reset(); rtGradeOutTex_.Reset();
-    rtPreviewRtv_.Reset(); rtPreviewTex_.Reset(); stagingPreviewTex_.Reset();
-    rtYRtv_.Reset(); rtYTex_.Reset(); stagingYTex_.Reset();
-    rtUVRtv_.Reset(); rtUVTex_.Reset(); stagingUVTex_.Reset();
+    rtPreviewRtv_.Reset(); rtPreviewTex_.Reset();
+    stagingPreviewTex_[0].Reset(); stagingPreviewTex_[1].Reset();
+    rtYRtv_.Reset(); rtYTex_.Reset();
+    stagingYTex_[0].Reset(); stagingYTex_[1].Reset();
+    rtUVRtv_.Reset(); rtUVTex_.Reset();
+    stagingUVTex_[0].Reset(); stagingUVTex_[1].Reset();
+    texMaskSrv_.Reset(); texMask_.Reset();
+    texCustomBgSrv_.Reset(); texCustomBg_.Reset();
+    rtAiRtv_.Reset(); rtAiTex_.Reset();
+    stagingAiTex_[0].Reset(); stagingAiTex_[1].Reset();
+
     cbGeom_.Reset(); cbBeauty_.Reset(); cbGrade_.Reset();
     psGeom_.Reset(); psBeauty_.Reset(); psGrade_.Reset(); psToY_.Reset(); psToUV_.Reset();
     fullscreenVS_.Reset();
@@ -283,7 +365,140 @@ bool GpuProcessor::CompileShaders() {
     return true;
 }
 
-bool GpuProcessor::EnsureInputTextures(InputPixelFormat, uint32_t w, uint32_t h) {
+bool GpuProcessor::EnsureAiResources() {
+    if (texMask_ && texCustomBg_ && rtAiTex_) return true;
+
+    // 256x256 dynamic R8 AI segmentation mask
+    D3D11_TEXTURE2D_DESC md{};
+    md.Width = 256;
+    md.Height = 256;
+    md.MipLevels = 1;
+    md.ArraySize = 1;
+    md.Format = DXGI_FORMAT_R8_UNORM;
+    md.SampleDesc.Count = 1;
+    md.Usage = D3D11_USAGE_DYNAMIC;
+    md.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    md.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    std::vector<uint8_t> initMask(256u * 256u, 255u);
+    D3D11_SUBRESOURCE_DATA initData{ initMask.data(), 256u, 0u };
+    if (FAILED(device_->CreateTexture2D(&md, &initData, &texMask_)) ||
+        FAILED(device_->CreateShaderResourceView(texMask_.Get(), nullptr, &texMaskSrv_))) {
+        return false;
+    }
+
+    // 1x1 fallback custom background texture so SRV t3 is always valid
+    D3D11_TEXTURE2D_DESC bd{};
+    bd.Width = 1;
+    bd.Height = 1;
+    bd.MipLevels = 1;
+    bd.ArraySize = 1;
+    bd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    bd.SampleDesc.Count = 1;
+    bd.Usage = D3D11_USAGE_IMMUTABLE;
+    bd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    const uint8_t blackPx[4] = { 24, 20, 18, 255 };
+    D3D11_SUBRESOURCE_DATA bgData{ blackPx, 4u, 0u };
+    if (FAILED(device_->CreateTexture2D(&bd, &bgData, &texCustomBg_)) ||
+        FAILED(device_->CreateShaderResourceView(texCustomBg_.Get(), nullptr, &texCustomBgSrv_))) {
+        return false;
+    }
+
+    if (!CreateRenderTargetTex(device_.Get(), kAiExtractW, kAiExtractH, DXGI_FORMAT_B8G8R8A8_UNORM, rtAiTex_, rtAiRtv_, nullptr)) {
+        return false;
+    }
+    if (!CreateStagingTex(device_.Get(), kAiExtractW, kAiExtractH, DXGI_FORMAT_B8G8R8A8_UNORM, stagingAiTex_[0]) ||
+        !CreateStagingTex(device_.Get(), kAiExtractW, kAiExtractH, DXGI_FORMAT_B8G8R8A8_UNORM, stagingAiTex_[1])) {
+        return false;
+    }
+
+    aiExtractBuf_.resize(static_cast<size_t>(kAiExtractW) * kAiExtractH * 4u);
+    return true;
+}
+
+bool GpuProcessor::SetCustomBackgroundPath(const std::string& utf8Path) {
+    if (utf8Path.empty()) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        hasCustomBg_ = false;
+        return true;
+    }
+
+    const std::wstring widePath = Utf8ToWide(utf8Path);
+    if (widePath.empty()) return false;
+
+    const HRESULT hrCo = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const bool needUninit = (hrCo == S_OK || hrCo == S_FALSE);
+
+    uint32_t imgW = 0, imgH = 0;
+    std::vector<uint8_t> bgra;
+
+    {
+        ComPtr<IWICImagingFactory> factory;
+        ComPtr<IWICBitmapDecoder> decoder;
+        ComPtr<IWICBitmapFrameDecode> frame;
+        ComPtr<IWICFormatConverter> converter;
+
+        if (SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory))) &&
+            SUCCEEDED(factory->CreateDecoderFromFilename(widePath.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnLoad, &decoder)) &&
+            SUCCEEDED(decoder->GetFrame(0, &frame))) {
+            UINT w = 0, h = 0;
+            if (SUCCEEDED(frame->GetSize(&w, &h)) && w > 0 && h > 0) {
+                IWICBitmapSource* source = frame.Get();
+                ComPtr<IWICBitmapScaler> scaler;
+                if (w > 1920 || h > 1080) {
+                    const double scale = std::min(1920.0 / w, 1080.0 / h);
+                    UINT nw = std::max<UINT>(1u, static_cast<UINT>(std::lround(w * scale)));
+                    UINT nh = std::max<UINT>(1u, static_cast<UINT>(std::lround(h * scale)));
+                    if (SUCCEEDED(factory->CreateBitmapScaler(&scaler)) &&
+                        SUCCEEDED(scaler->Initialize(frame.Get(), nw, nh, WICBitmapInterpolationModeFant))) {
+                        w = nw;
+                        h = nh;
+                        source = scaler.Get();
+                    }
+                }
+                if (SUCCEEDED(factory->CreateFormatConverter(&converter)) &&
+                    SUCCEEDED(converter->Initialize(source, GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom))) {
+                    imgW = w;
+                    imgH = h;
+                    bgra.resize(static_cast<size_t>(imgW) * imgH * 4u);
+                    if (FAILED(converter->CopyPixels(nullptr, imgW * 4u, static_cast<UINT>(bgra.size()), bgra.data()))) {
+                        bgra.clear();
+                    }
+                }
+            }
+        }
+    }
+
+    if (needUninit) CoUninitialize();
+    if (bgra.empty() || imgW == 0 || imgH == 0) return false;
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!device_) return false;
+
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = imgW;
+    td.Height = imgH;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_IMMUTABLE;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    D3D11_SUBRESOURCE_DATA initData{ bgra.data(), imgW * 4u, 0u };
+
+    ComPtr<ID3D11Texture2D> newTex;
+    ComPtr<ID3D11ShaderResourceView> newSrv;
+    if (FAILED(device_->CreateTexture2D(&td, &initData, &newTex)) ||
+        FAILED(device_->CreateShaderResourceView(newTex.Get(), nullptr, &newSrv))) {
+        return false;
+    }
+
+    texCustomBg_ = newTex;
+    texCustomBgSrv_ = newSrv;
+    hasCustomBg_ = true;
+    return true;
+}
+
+bool GpuProcessor::EnsureInputTextures(uint32_t w, uint32_t h) {
     if (srcTexW_ == w && srcTexH_ == h && srcYTex_ && srcUVTex_ && srcBgraTex_) {
         return true;
     }
@@ -322,20 +537,37 @@ bool GpuProcessor::EnsureOutputTextures(uint32_t w, uint32_t h) {
     rtGeomSrv_.Reset(); rtGeomRtv_.Reset(); rtGeomTex_.Reset();
     rtBeautySrv_.Reset(); rtBeautyRtv_.Reset(); rtBeautyTex_.Reset();
     rtGradeOutSrv_.Reset(); rtGradeOutRtv_.Reset(); rtGradeOutTex_.Reset();
-    rtPreviewRtv_.Reset(); rtPreviewTex_.Reset(); stagingPreviewTex_.Reset();
-    rtYRtv_.Reset(); rtYTex_.Reset(); stagingYTex_.Reset();
-    rtUVRtv_.Reset(); rtUVTex_.Reset(); stagingUVTex_.Reset();
+    rtPreviewRtv_.Reset(); rtPreviewTex_.Reset();
+    stagingPreviewTex_[0].Reset(); stagingPreviewTex_[1].Reset();
+    rtYRtv_.Reset(); rtYTex_.Reset();
+    stagingYTex_[0].Reset(); stagingYTex_[1].Reset();
+    rtUVRtv_.Reset(); rtUVTex_.Reset();
+    stagingUVTex_[0].Reset(); stagingUVTex_[1].Reset();
+
+    previewW_ = std::min(w, 640u);
+    previewH_ = std::max(2u, ((h * previewW_) / std::max(w, 1u)) & ~1u);
 
     if (!CreateRenderTargetTex(device_.Get(), w, h, DXGI_FORMAT_B8G8R8A8_UNORM, rtGeomTex_, rtGeomRtv_, &rtGeomSrv_)) return false;
     if (!CreateRenderTargetTex(device_.Get(), w, h, DXGI_FORMAT_B8G8R8A8_UNORM, rtBeautyTex_, rtBeautyRtv_, &rtBeautySrv_)) return false;
     if (!CreateRenderTargetTex(device_.Get(), w, h, DXGI_FORMAT_B8G8R8A8_UNORM, rtGradeOutTex_, rtGradeOutRtv_, &rtGradeOutSrv_)) return false;
-    if (!CreateRenderTargetTex(device_.Get(), w, h, DXGI_FORMAT_B8G8R8A8_UNORM, rtPreviewTex_, rtPreviewRtv_, nullptr)) return false;
-    if (!CreateStagingTex(device_.Get(), w, h, DXGI_FORMAT_B8G8R8A8_UNORM, stagingPreviewTex_)) return false;
+    if (!CreateRenderTargetTex(device_.Get(), previewW_, previewH_, DXGI_FORMAT_B8G8R8A8_UNORM, rtPreviewTex_, rtPreviewRtv_, nullptr)) return false;
+
+    if (!CreateStagingTex(device_.Get(), previewW_, previewH_, DXGI_FORMAT_B8G8R8A8_UNORM, stagingPreviewTex_[0]) ||
+        !CreateStagingTex(device_.Get(), previewW_, previewH_, DXGI_FORMAT_B8G8R8A8_UNORM, stagingPreviewTex_[1])) {
+        return false;
+    }
 
     if (!CreateRenderTargetTex(device_.Get(), w, h, DXGI_FORMAT_R8_UNORM, rtYTex_, rtYRtv_, nullptr)) return false;
-    if (!CreateStagingTex(device_.Get(), w, h, DXGI_FORMAT_R8_UNORM, stagingYTex_)) return false;
+    if (!CreateStagingTex(device_.Get(), w, h, DXGI_FORMAT_R8_UNORM, stagingYTex_[0]) ||
+        !CreateStagingTex(device_.Get(), w, h, DXGI_FORMAT_R8_UNORM, stagingYTex_[1])) {
+        return false;
+    }
+
     if (!CreateRenderTargetTex(device_.Get(), w / 2, h / 2, DXGI_FORMAT_R8G8_UNORM, rtUVTex_, rtUVRtv_, nullptr)) return false;
-    if (!CreateStagingTex(device_.Get(), w / 2, h / 2, DXGI_FORMAT_R8G8_UNORM, stagingUVTex_)) return false;
+    if (!CreateStagingTex(device_.Get(), w / 2, h / 2, DXGI_FORMAT_R8G8_UNORM, stagingUVTex_[0]) ||
+        !CreateStagingTex(device_.Get(), w / 2, h / 2, DXGI_FORMAT_R8G8_UNORM, stagingUVTex_[1])) {
+        return false;
+    }
 
     outTexW_ = w;
     outTexH_ = h;
@@ -373,13 +605,115 @@ void GpuProcessor::DrawPass(
     ctx_->OMSetRenderTargets(1, &nullRtv, nullptr);
 }
 
+void GpuProcessor::UploadMaskIfNeeded(const AiStateSnapshot& ai, int bgMode) {
+    if (bgMode <= 0 || !ai.hasValidMask || ai.mask256.size() != 256u * 256u) {
+        return;
+    }
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (SUCCEEDED(ctx_->Map(texMask_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+        const uint8_t* src = ai.mask256.data();
+        uint8_t* dst = static_cast<uint8_t*>(mapped.pData);
+        for (uint32_t r = 0; r < 256u; ++r) {
+            std::memcpy(dst + static_cast<size_t>(r) * mapped.RowPitch, src + static_cast<size_t>(r) * 256u, 256u);
+        }
+        ctx_->Unmap(texMask_.Get(), 0);
+    }
+}
+
+void GpuProcessor::SubmitAsyncAiExtractIfNeeded(const PC_VideoParams& params, bool needAwbSample) {
+    const bool needSeg = (!params.bypassEffects && params.bgMode > 0);
+    const bool needFace = (!params.bypassEffects && (
+        params.arFilterMode > 0 ||
+        params.autoFrameEnabled != 0 ||
+        params.faceSlim > 0.01f ||
+        params.eyeEnlarge > 0.01f ||
+        params.eyeBrighten > 0.01f ||
+        params.teethWhiten > 0.01f));
+
+    if (!(aiEngine_ && (needSeg || needFace)) && !needAwbSample) {
+        aiRingWarmed_ = false;
+        return;
+    }
+
+    // Read previous frame's 480x270 extract non-blockingly so GPU pipeline never stalls
+    if (aiRingWarmed_) {
+        const int readSlot = aiStagingIdx_ ^ 1;
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        if (SUCCEEDED(ctx_->Map(stagingAiTex_[readSlot].Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped))) {
+            for (uint32_t r = 0; r < kAiExtractH; ++r) {
+                std::memcpy(aiExtractBuf_.data() + static_cast<size_t>(r) * kAiExtractW * 4u,
+                            static_cast<const uint8_t*>(mapped.pData) + static_cast<size_t>(r) * mapped.RowPitch,
+                            static_cast<size_t>(kAiExtractW) * 4u);
+            }
+            ctx_->Unmap(stagingAiTex_[readSlot].Get(), 0);
+
+            if (needAwbSample) {
+                UpdateAutoWhiteBalance(aiExtractBuf_.data(), kAiExtractW, kAiExtractH);
+            }
+            if (aiEngine_ && (needSeg || needFace)) {
+                aiEngine_->SubmitFrameAsync(aiExtractBuf_.data(), kAiExtractW, kAiExtractH, needSeg, needFace);
+            }
+        }
+    }
+
+    // Downscale rtGeomTex_ (already oriented) -> rtAiTex_ (480x270) via psGeom_ inputMode=1
+    GeomCBData copyCb{};
+    copyCb.srcWidth = 1.0f;
+    copyCb.srcHeight = 1.0f;
+    copyCb.outWidth = 1.0f;
+    copyCb.outHeight = 1.0f;
+    copyCb.inputMode = 1;
+    copyCb.zoom = 1.0f;
+
+    D3D11_MAPPED_SUBRESOURCE ms{};
+    if (SUCCEEDED(ctx_->Map(cbGeom_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) {
+        std::memcpy(ms.pData, &copyCb, sizeof(copyCb));
+        ctx_->Unmap(cbGeom_.Get(), 0);
+    }
+
+    ID3D11ShaderResourceView* srvs[3] = { nullptr, nullptr, rtGeomSrv_.Get() };
+    DrawPass(psGeom_.Get(), rtAiRtv_.GetAddressOf(), 1, kAiExtractW, kAiExtractH, srvs, 3, cbGeom_.Get());
+    ctx_->CopyResource(stagingAiTex_[aiStagingIdx_].Get(), rtAiTex_.Get());
+
+    aiStagingIdx_ ^= 1;
+    aiRingWarmed_ = true;
+}
+
+void GpuProcessor::UpdateCenterStage(const PC_VideoParams& params, const AiStateSnapshot& ai) {
+    if (!params.bypassEffects && params.autoFrameEnabled != 0 && ai.face.detected) {
+        const float targetZoom = std::clamp(0.42f / std::max(ai.face.boxH, 0.14f), 1.0f, 1.85f);
+        if (std::abs(targetZoom - autoZoom_) > 0.04f) {
+            autoZoom_ = autoZoom_ * 0.94f + targetZoom * 0.06f;
+        }
+        const float faceCx = ai.face.boxX + ai.face.boxW * 0.5f;
+        const float faceCy = ai.face.boxY + ai.face.boxH * 0.45f;
+        const float dx = faceCx - 0.5f;
+        const float dy = faceCy - 0.44f;
+        if (std::abs(dx) > 0.03f) {
+            const float dirX = params.flipH ? -dx : dx;
+            autoPanX_ = std::clamp(autoPanX_ + (dirX / std::max(autoZoom_, 1.0f)) * 0.07f, -0.35f, 0.35f);
+        }
+        if (std::abs(dy) > 0.03f) {
+            const float dirY = params.flipV ? -dy : dy;
+            autoPanY_ = std::clamp(autoPanY_ + (dirY / std::max(autoZoom_, 1.0f)) * 0.07f, -0.35f, 0.35f);
+        }
+    } else {
+        autoZoom_ = autoZoom_ * 0.88f + 1.0f * 0.12f;
+        autoPanX_ *= 0.88f;
+        autoPanY_ *= 0.88f;
+        if (std::abs(autoZoom_ - 1.0f) < 0.005f) autoZoom_ = 1.0f;
+        if (std::abs(autoPanX_) < 0.002f) autoPanX_ = 0.0f;
+        if (std::abs(autoPanY_) < 0.002f) autoPanY_ = 0.0f;
+    }
+}
+
 void GpuProcessor::UpdateAutoWhiteBalance(const uint8_t* bgra, uint32_t w, uint32_t h) {
     if (!bgra || w < 16 || h < 16) return;
     double sumR = 0.0, sumG = 0.0, sumB = 0.0;
     uint32_t count = 0;
-    for (uint32_t y = h / 8; y < (h * 7) / 8; y += 16) {
+    for (uint32_t y = h / 8; y < (h * 7) / 8; y += 8) {
         const uint8_t* row = bgra + static_cast<size_t>(y) * w * 4;
-        for (uint32_t x = w / 8; x < (w * 7) / 8; x += 16) {
+        for (uint32_t x = w / 8; x < (w * 7) / 8; x += 8) {
             const float b = row[x * 4 + 0];
             const float g = row[x * 4 + 1];
             const float r = row[x * 4 + 2];
@@ -411,7 +745,8 @@ bool GpuProcessor::ProcessFrame(
     const RawFrameInput& input,
     const PC_VideoParams& params,
     bool producePreview,
-    ProcessedFrameOutput& output) {
+    ProcessedFrameOutput& output,
+    const AiStateSnapshot* overrideAi) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!device_ || !input.data || input.width < 16 || input.height < 16) return false;
 
@@ -420,11 +755,22 @@ bool GpuProcessor::ProcessFrame(
     const uint32_t outH = (params.outputHeight >= 360 && params.outputHeight <= 1080)
         ? (static_cast<uint32_t>(params.outputHeight) & ~1u) : 720u;
 
-    if (!EnsureInputTextures(input.format, input.width, input.height) ||
-        !EnsureOutputTextures(outW, outH)) {
+    if (!EnsureInputTextures(input.width, input.height) ||
+        !EnsureOutputTextures(outW, outH) ||
+        !EnsureAiResources()) {
         lastError_ = "Failed creating GPU textures";
         return false;
     }
+
+    AiStateSnapshot aiState;
+    if (overrideAi) {
+        aiState = *overrideAi;
+    } else if (aiEngine_) {
+        aiEngine_->GetLatestState(aiState);
+    }
+
+    // Update Auto-Framing (Center Stage) before Pass 1 geometry
+    UpdateCenterStage(params, aiState);
 
     // Upload source pixels
     D3D11_MAPPED_SUBRESOURCE mapped{};
@@ -469,7 +815,7 @@ bool GpuProcessor::ProcessFrame(
         }
     };
 
-    // Pass 1: Geometry, Flip, Rotation, Smart Framing
+    // Pass 1: Geometry, Flip, Rotation, Smart Framing, Center Stage
     const int baseRot = params.autoRotateFromPhone ? input.sensorRotationDeg : 0;
     const int totalRot = ((baseRot + params.manualRotationDeg) % 360 + 360) % 360;
     GeomCBData geomCb{};
@@ -482,26 +828,49 @@ bool GpuProcessor::ProcessFrame(
     geomCb.flipH = params.flipH ? 1 : 0;
     geomCb.flipV = params.flipV ? 1 : 0;
     geomCb.framingMode = params.framingMode;
-    geomCb.zoom = std::clamp(params.zoom, 1.0f, 3.0f);
-    geomCb.panX = std::clamp(params.panX, -0.5f, 0.5f);
-    geomCb.panY = std::clamp(params.panY, -0.5f, 0.5f);
+    geomCb.zoom = std::clamp(params.zoom * autoZoom_, 1.0f, 3.0f);
+    geomCb.panX = std::clamp(params.panX + autoPanX_, -0.5f, 0.5f);
+    geomCb.panY = std::clamp(params.panY + autoPanY_, -0.5f, 0.5f);
     uploadCB(cbGeom_.Get(), &geomCb, sizeof(geomCb));
 
     ID3D11ShaderResourceView* geomSrvs[3] = { srcYSrv_.Get(), srcUVSrv_.Get(), srcBgraSrv_.Get() };
     DrawPass(psGeom_.Get(), rtGeomRtv_.GetAddressOf(), 1, outW, outH, geomSrvs, 3, cbGeom_.Get());
 
-    // Pass 2: Beauty & Studio Lighting
+    // Extract 480x270 oriented BGRA asynchronously for ONNX AI + Auto White Balance
+    if (!overrideAi) {
+        const bool needAwb = (!params.bypassEffects && params.autoWhiteBalance > 0.01f);
+        SubmitAsyncAiExtractIfNeeded(params, needAwb);
+    }
+
+    // Upload AI segmentation mask if active
+    UploadMaskIfNeeded(aiState, params.bypassEffects ? 0 : params.bgMode);
+
+    // Pass 2: AI-Guided Face Warp (Slim + Eye Enlarge) + Skin Smooth + Studio Lighting
     BeautyCBData beautyCb{};
     beautyCb.texWidth = static_cast<float>(outW);
     beautyCb.texHeight = static_cast<float>(outH);
     beautyCb.skinSmooth = params.bypassEffects ? 0.0f : std::clamp(params.skinSmooth, 0.0f, 1.0f);
     beautyCb.denoise = params.bypassEffects ? 0.0f : std::clamp(params.denoise, 0.0f, 1.0f);
     beautyCb.studioLight = params.bypassEffects ? 0.0f : std::clamp(params.studioLight, 0.0f, 1.0f);
+    beautyCb.faceSlim = params.bypassEffects ? 0.0f : std::clamp(params.faceSlim, 0.0f, 1.0f);
+    beautyCb.eyeEnlarge = params.bypassEffects ? 0.0f : std::clamp(params.eyeEnlarge, 0.0f, 1.0f);
+    beautyCb.faceDetected = aiState.face.detected ? 1.0f : 0.0f;
+    if (aiState.face.detected) {
+        beautyCb.faceCenterX = aiState.face.boxX + aiState.face.boxW * 0.5f;
+        beautyCb.faceCenterY = aiState.face.boxY + aiState.face.boxH * 0.5f;
+        beautyCb.faceScale = std::max(aiState.face.boxW, aiState.face.boxH);
+        beautyCb.rightEyeX = aiState.face.rightEyeX;
+        beautyCb.rightEyeY = aiState.face.rightEyeY;
+        beautyCb.leftEyeX = aiState.face.leftEyeX;
+        beautyCb.leftEyeY = aiState.face.leftEyeY;
+    }
     uploadCB(cbBeauty_.Get(), &beautyCb, sizeof(beautyCb));
 
     DrawPass(psBeauty_.Get(), rtBeautyRtv_.GetAddressOf(), 1, outW, outH, rtGeomSrv_.GetAddressOf(), 1, cbBeauty_.Get());
 
-    // Pass 3A: Virtual Camera Output Grading (NO preview split, NO selfie-mirror)
+    // Pass 3A: Virtual Camera Output Grading + AI Background + AR Filters + Stylized Shaders
+    const float elapsedSec = std::chrono::duration<float>(std::chrono::steady_clock::now() - startTime_).count();
+
     GradeCBData gradeCb{};
     gradeCb.texWidth = static_cast<float>(outW);
     gradeCb.texHeight = static_cast<float>(outH);
@@ -527,17 +896,58 @@ bool GpuProcessor::ProcessFrame(
     gradeCb.splitPos = -1.0f;
     gradeCb.bypassAll = params.bypassEffects ? 1.0f : 0.0f;
     gradeCb.previewFlipH = 0.0f;
+
+    gradeCb.bgMode = params.bypassEffects ? 0 : params.bgMode;
+    gradeCb.arFilterMode = params.bypassEffects ? 0 : params.arFilterMode;
+    gradeCb.styleFilterMode = params.bypassEffects ? 0 : params.styleFilterMode;
+    gradeCb.bgBlurStrength = std::clamp(params.bgBlurStrength, 0.0f, 1.0f);
+    gradeCb.eyeBrighten = std::clamp(params.eyeBrighten, 0.0f, 1.0f);
+    gradeCb.teethWhiten = std::clamp(params.teethWhiten, 0.0f, 1.0f);
+    gradeCb.styleIntensity = std::clamp(params.styleIntensity, 0.0f, 1.0f);
+    gradeCb.timeSec = elapsedSec;
+
+    gradeCb.hasCustomBg = hasCustomBg_ ? 1.0f : 0.0f;
+    gradeCb.hasAiMask = aiState.hasValidMask ? 1.0f : 0.0f;
+    gradeCb.faceDetected = aiState.face.detected ? 1.0f : 0.0f;
+    gradeCb.faceConf = aiState.face.confidence;
+    if (aiState.face.detected) {
+        gradeCb.rightEyeX = aiState.face.rightEyeX;
+        gradeCb.rightEyeY = aiState.face.rightEyeY;
+        gradeCb.leftEyeX = aiState.face.leftEyeX;
+        gradeCb.leftEyeY = aiState.face.leftEyeY;
+        gradeCb.noseX = aiState.face.noseX;
+        gradeCb.noseY = aiState.face.noseY;
+        if (aiState.face.rightMouthX > 0.001f || aiState.face.leftMouthX > 0.001f) {
+            gradeCb.mouthCenterX = 0.5f * (aiState.face.rightMouthX + aiState.face.leftMouthX);
+            gradeCb.mouthCenterY = 0.5f * (aiState.face.rightMouthY + aiState.face.leftMouthY);
+        } else {
+            gradeCb.mouthCenterX = aiState.face.noseX;
+            gradeCb.mouthCenterY = aiState.face.boxY + aiState.face.boxH * 0.72f;
+        }
+        gradeCb.faceBoxX = aiState.face.boxX;
+        gradeCb.faceBoxY = aiState.face.boxY;
+        gradeCb.faceBoxW = aiState.face.boxW;
+        gradeCb.faceBoxH = aiState.face.boxH;
+    }
     uploadCB(cbGrade_.Get(), &gradeCb, sizeof(gradeCb));
 
-    ID3D11ShaderResourceView* gradeSrvs[2] = { rtBeautySrv_.Get(), rtGeomSrv_.Get() };
-    DrawPass(psGrade_.Get(), rtGradeOutRtv_.GetAddressOf(), 1, outW, outH, gradeSrvs, 2, cbGrade_.Get());
+    ID3D11ShaderResourceView* gradeSrvs[4] = {
+        rtBeautySrv_.Get(),
+        rtGeomSrv_.Get(),
+        texMaskSrv_.Get(),
+        texCustomBgSrv_.Get()
+    };
+    DrawPass(psGrade_.Get(), rtGradeOutRtv_.GetAddressOf(), 1, outW, outH, gradeSrvs, 4, cbGrade_.Get());
 
     // Pass 4: Convert Graded RGBA -> NV12 Y & UV planes
     DrawPass(psToY_.Get(), rtYRtv_.GetAddressOf(), 1, outW, outH, rtGradeOutSrv_.GetAddressOf(), 1, nullptr);
     DrawPass(psToUV_.Get(), rtUVRtv_.GetAddressOf(), 1, outW / 2, outH / 2, rtGradeOutSrv_.GetAddressOf(), 1, nullptr);
 
-    ctx_->CopyResource(stagingYTex_.Get(), rtYTex_.Get());
-    ctx_->CopyResource(stagingUVTex_.Get(), rtUVTex_.Get());
+    const int slot = stagingIdx_;
+    stagingIdx_ ^= 1;
+
+    ctx_->CopyResource(stagingYTex_[slot].Get(), rtYTex_.Get());
+    ctx_->CopyResource(stagingUVTex_[slot].Get(), rtUVTex_.Get());
 
     const size_t yBytes = static_cast<size_t>(outW) * outH;
     const size_t uvBytes = yBytes / 2;
@@ -545,51 +955,61 @@ bool GpuProcessor::ProcessFrame(
     output.width = outW;
     output.height = outH;
 
-    if (SUCCEEDED(ctx_->Map(stagingYTex_.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+    if (SUCCEEDED(ctx_->Map(stagingYTex_[slot].Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
         for (uint32_t r = 0; r < outH; ++r) {
             std::memcpy(output.nv12.data() + static_cast<size_t>(r) * outW,
                         static_cast<const uint8_t*>(mapped.pData) + r * mapped.RowPitch,
                         outW);
         }
-        ctx_->Unmap(stagingYTex_.Get(), 0);
+        ctx_->Unmap(stagingYTex_[slot].Get(), 0);
     }
 
-    if (SUCCEEDED(ctx_->Map(stagingUVTex_.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+    if (SUCCEEDED(ctx_->Map(stagingUVTex_[slot].Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
         uint8_t* dstUV = output.nv12.data() + yBytes;
         for (uint32_t r = 0; r < outH / 2; ++r) {
             std::memcpy(dstUV + static_cast<size_t>(r) * outW,
                         static_cast<const uint8_t*>(mapped.pData) + r * mapped.RowPitch,
                         outW);
         }
-        ctx_->Unmap(stagingUVTex_.Get(), 0);
+        ctx_->Unmap(stagingUVTex_[slot].Get(), 0);
     }
 
-    // Optional Preview pass (handles Selfie preview flip & Before/After split compare)
-    if (producePreview || params.autoWhiteBalance > 0.01f) {
-        const bool needCustomPreview = (params.previewMirrorLocal != 0) || (params.splitComparePos >= 0.0f);
+    // Optional lightweight Preview pass (<= 640x360 BGRA, handles Selfie mirror & Split compare)
+    if (producePreview) {
+        const bool needCustomPreview =
+            (params.previewMirrorLocal != 0) ||
+            (params.splitComparePos >= 0.0f) ||
+            (previewW_ != outW) ||
+            (previewH_ != outH);
+
         ID3D11Texture2D* previewSrc = rtGradeOutTex_.Get();
         if (needCustomPreview) {
+            gradeCb.texWidth = static_cast<float>(previewW_);
+            gradeCb.texHeight = static_cast<float>(previewH_);
             gradeCb.isPreview = 1.0f;
             gradeCb.splitPos = params.splitComparePos;
             gradeCb.previewFlipH = params.previewMirrorLocal ? 1.0f : 0.0f;
             uploadCB(cbGrade_.Get(), &gradeCb, sizeof(gradeCb));
-            DrawPass(psGrade_.Get(), rtPreviewRtv_.GetAddressOf(), 1, outW, outH, gradeSrvs, 2, cbGrade_.Get());
+            DrawPass(psGrade_.Get(), rtPreviewRtv_.GetAddressOf(), 1, previewW_, previewH_, gradeSrvs, 4, cbGrade_.Get());
             previewSrc = rtPreviewTex_.Get();
         }
-        ctx_->CopyResource(stagingPreviewTex_.Get(), previewSrc);
-        if (SUCCEEDED(ctx_->Map(stagingPreviewTex_.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
-            output.previewBgra.resize(static_cast<size_t>(outW) * outH * 4u);
-            for (uint32_t r = 0; r < outH; ++r) {
-                std::memcpy(output.previewBgra.data() + static_cast<size_t>(r) * outW * 4u,
-                            static_cast<const uint8_t*>(mapped.pData) + r * mapped.RowPitch,
-                            static_cast<size_t>(outW) * 4u);
-            }
-            ctx_->Unmap(stagingPreviewTex_.Get(), 0);
 
-            if (params.autoWhiteBalance > 0.01f) {
-                UpdateAutoWhiteBalance(output.previewBgra.data(), outW, outH);
+        ctx_->CopyResource(stagingPreviewTex_[slot].Get(), previewSrc);
+        if (SUCCEEDED(ctx_->Map(stagingPreviewTex_[slot].Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+            output.previewWidth = previewW_;
+            output.previewHeight = previewH_;
+            output.previewBgra.resize(static_cast<size_t>(previewW_) * previewH_ * 4u);
+            for (uint32_t r = 0; r < previewH_; ++r) {
+                std::memcpy(output.previewBgra.data() + static_cast<size_t>(r) * previewW_ * 4u,
+                            static_cast<const uint8_t*>(mapped.pData) + r * mapped.RowPitch,
+                            static_cast<size_t>(previewW_) * 4u);
             }
+            ctx_->Unmap(stagingPreviewTex_[slot].Get(), 0);
         }
+    } else {
+        output.previewWidth = 0;
+        output.previewHeight = 0;
+        output.previewBgra.clear();
     }
 
     return true;

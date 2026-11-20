@@ -68,6 +68,18 @@
             <Setter Property="VerticalAlignment" Value="Center" />
         </Style>
 
+        <Style TargetType="ComboBox">
+            <Setter Property="Foreground" Value="#0F172A" />
+            <Setter Property="Background" Value="#E2E8F0" />
+            <Setter Property="Padding" Value="8,5" />
+            <Setter Property="FontWeight" Value="SemiBold" />
+        </Style>
+
+        <Style TargetType="ComboBoxItem">
+            <Setter Property="Foreground" Value="#0F172A" />
+            <Setter Property="Padding" Value="8,5" />
+        </Style>
+
         <Style TargetType="TabControl">
             <Setter Property="Background" Value="Transparent" />
             <Setter Property="BorderThickness" Value="0" />
@@ -76,7 +88,8 @@
         <Style TargetType="TabItem">
             <Setter Property="Foreground" Value="#94A3B8" />
             <Setter Property="Background" Value="#131926" />
-            <Setter Property="Padding" Value="10,8" />
+            <Setter Property="Padding" Value="7,6" />
+            <Setter Property="FontSize" Value="12" />
             <Setter Property="FontWeight" Value="SemiBold" />
             <Setter Property="Template">
                 <Setter.Value>

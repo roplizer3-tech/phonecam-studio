@@ -7,6 +7,7 @@
 #include <propvarutil.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 
 using Microsoft::WRL::ComPtr;
@@ -27,7 +28,11 @@ bool VideoDecoder::Initialize() {
         CLSCTX_INPROC_SERVER,
         IID_PPV_ARGS(&wicFactory_));
 
-    return InitH264Mft();
+    InitDxvaDevice();
+    if (!InitH264Mft(true)) {
+        return InitH264Mft(false);
+    }
+    return true;
 }
 
 void VideoDecoder::Shutdown() {
@@ -35,7 +40,15 @@ void VideoDecoder::Shutdown() {
         h264Mft_->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
         h264Mft_.Reset();
     }
+    dxvaStagingTex_.Reset();
+    dxvaStagingW_ = 0;
+    dxvaStagingH_ = 0;
+    dxvaStagingFmt_ = DXGI_FORMAT_UNKNOWN;
+    dxgiManager_.Reset();
+    dxvaCtx_.Reset();
+    dxvaDevice_.Reset();
     wicFactory_.Reset();
+    usingDxva_ = false;
     h264OutputReady_ = false;
     MFShutdown();
 }
@@ -47,11 +60,58 @@ void VideoDecoder::ResetH264() {
     }
     h264Mft_.Reset();
     h264OutputReady_ = false;
-    InitH264Mft();
+    usingDxva_ = false;
+    if (!InitH264Mft(true)) {
+        InitH264Mft(false);
+    }
 }
 
-bool VideoDecoder::InitH264Mft() {
+bool VideoDecoder::InitDxvaDevice() {
+    const D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1 };
+    D3D_FEATURE_LEVEL chosen{};
+    HRESULT hr = D3D11CreateDevice(
+        nullptr,
+        D3D_DRIVER_TYPE_HARDWARE,
+        nullptr,
+        D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+        levels,
+        _countof(levels),
+        D3D11_SDK_VERSION,
+        &dxvaDevice_,
+        &chosen,
+        &dxvaCtx_);
+    if (FAILED(hr) || !dxvaDevice_) {
+        dxvaDevice_.Reset();
+        dxvaCtx_.Reset();
+        return false;
+    }
+
+    ComPtr<ID3D10Multithread> mt;
+    if (SUCCEEDED(dxvaDevice_.As(&mt))) {
+        mt->SetMultithreadProtected(TRUE);
+    }
+
+    hr = MFCreateDXGIDeviceManager(&dxgiResetToken_, &dxgiManager_);
+    if (FAILED(hr) || !dxgiManager_) {
+        dxvaCtx_.Reset();
+        dxvaDevice_.Reset();
+        return false;
+    }
+
+    hr = dxgiManager_->ResetDevice(dxvaDevice_.Get(), dxgiResetToken_);
+    if (FAILED(hr)) {
+        dxgiManager_.Reset();
+        dxvaCtx_.Reset();
+        dxvaDevice_.Reset();
+        return false;
+    }
+    return true;
+}
+
+bool VideoDecoder::InitH264Mft(bool allowDxva) {
     h264OutputReady_ = false;
+    usingDxva_ = false;
+
     HRESULT hr = CoCreateInstance(
         CLSID_MSH264DecoderMFT,
         nullptr,
@@ -67,15 +127,37 @@ bool VideoDecoder::InitH264Mft() {
         codecApi->SetValue(&CODECAPI_AVLowLatencyMode, &var);
     }
 
+    if (allowDxva && dxgiManager_) {
+        ComPtr<IMFAttributes> attrs;
+        UINT32 d3d11Aware = 0;
+        if (SUCCEEDED(h264Mft_->GetAttributes(&attrs)) &&
+            SUCCEEDED(attrs->GetUINT32(MF_SA_D3D11_AWARE, &d3d11Aware)) &&
+            d3d11Aware != 0) {
+            if (SUCCEEDED(h264Mft_->ProcessMessage(
+                    MFT_MESSAGE_SET_D3D_MANAGER,
+                    reinterpret_cast<ULONG_PTR>(dxgiManager_.Get())))) {
+                usingDxva_ = true;
+            }
+        }
+    }
+
     ComPtr<IMFMediaType> inType;
-    if (FAILED(MFCreateMediaType(&inType))) return false;
+    if (FAILED(MFCreateMediaType(&inType))) {
+        h264Mft_.Reset();
+        usingDxva_ = false;
+        return false;
+    }
     inType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
     inType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
     MFSetAttributeSize(inType.Get(), MF_MT_FRAME_SIZE, 1280, 720);
-    MFSetAttributeRatio(inType.Get(), MF_MT_FRAME_RATE, 30, 1);
+    MFSetAttributeRatio(inType.Get(), MF_MT_FRAME_RATE, 60, 1);
 
     hr = h264Mft_->SetInputType(0, inType.Get(), 0);
-    if (FAILED(hr)) return false;
+    if (FAILED(hr)) {
+        h264Mft_.Reset();
+        usingDxva_ = false;
+        return false;
+    }
 
     NegotiateH264OutputType();
     h264Mft_->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
@@ -132,7 +214,7 @@ bool VideoDecoder::NegotiateH264OutputType() {
 
 bool VideoDecoder::DecodeH264(const uint8_t* annexB, size_t size, uint64_t timestampMs, DecodedFrame& outFrame) {
     if (!annexB || size == 0) return false;
-    if (!h264Mft_ && !InitH264Mft()) return false;
+    if (!h264Mft_ && !InitH264Mft(true) && !InitH264Mft(false)) return false;
 
     ComPtr<IMFSample> inSample;
     ComPtr<IMFMediaBuffer> inBuf;
@@ -147,11 +229,10 @@ bool VideoDecoder::DecodeH264(const uint8_t* annexB, size_t size, uint64_t times
     inBuf->SetCurrentLength(static_cast<DWORD>(size));
     inSample->AddBuffer(inBuf.Get());
     inSample->SetSampleTime(static_cast<LONGLONG>(timestampMs) * 10000LL);
-    inSample->SetSampleDuration(333333LL);
+    inSample->SetSampleDuration(166667LL);
 
     HRESULT hr = h264Mft_->ProcessInput(0, inSample.Get(), 0);
     if (hr == MF_E_NOTACCEPTING) {
-        // Drain pending output and retry once
         MFT_OUTPUT_DATA_BUFFER outData{};
         DWORD status = 0;
         ComPtr<IMFSample> tmpSample;
@@ -167,7 +248,16 @@ bool VideoDecoder::DecodeH264(const uint8_t* annexB, size_t size, uint64_t times
         if (outData.pEvents) outData.pEvents->Release();
         hr = h264Mft_->ProcessInput(0, inSample.Get(), 0);
     }
-    if (FAILED(hr)) return false;
+    if (FAILED(hr)) {
+        if (usingDxva_) {
+            h264Mft_.Reset();
+            usingDxva_ = false;
+            if (InitH264Mft(false)) {
+                hr = h264Mft_->ProcessInput(0, inSample.Get(), 0);
+            }
+        }
+        if (FAILED(hr)) return false;
+    }
 
     bool gotFrame = false;
     for (int iter = 0; iter < 8; ++iter) {
@@ -211,13 +301,82 @@ bool VideoDecoder::DecodeH264(const uint8_t* annexB, size_t size, uint64_t times
     return gotFrame;
 }
 
-bool VideoDecoder::ReadH264OutputSample(IMFSample* sample, DecodedFrame& outFrame) {
-    ComPtr<IMFMediaBuffer> buf;
-    if (FAILED(sample->ConvertToContiguousBuffer(&buf))) return false;
+bool VideoDecoder::CopyDxgiSurfaceToNv12(ID3D11Texture2D* tex, UINT subresourceIdx, DecodedFrame& outFrame) {
+    if (!tex || !dxvaDevice_ || !dxvaCtx_) return false;
+    D3D11_TEXTURE2D_DESC td{};
+    tex->GetDesc(&td);
+    if (td.Format != DXGI_FORMAT_NV12 || td.Width < displayW_ || td.Height < displayH_) {
+        return false;
+    }
+
+    if (!dxvaStagingTex_ || dxvaStagingW_ != td.Width || dxvaStagingH_ != td.Height || dxvaStagingFmt_ != td.Format) {
+        dxvaStagingTex_.Reset();
+        D3D11_TEXTURE2D_DESC sd = td;
+        sd.MipLevels = 1;
+        sd.ArraySize = 1;
+        sd.SampleDesc.Count = 1;
+        sd.Usage = D3D11_USAGE_STAGING;
+        sd.BindFlags = 0;
+        sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        sd.MiscFlags = 0;
+        if (FAILED(dxvaDevice_->CreateTexture2D(&sd, nullptr, &dxvaStagingTex_))) {
+            return false;
+        }
+        dxvaStagingW_ = td.Width;
+        dxvaStagingH_ = td.Height;
+        dxvaStagingFmt_ = td.Format;
+    }
+
+    dxvaCtx_->CopySubresourceRegion(dxvaStagingTex_.Get(), 0, 0, 0, 0, tex, subresourceIdx, nullptr);
+
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (FAILED(dxvaCtx_->Map(dxvaStagingTex_.Get(), 0, D3D11_MAP_READ, 0, &mapped))) {
+        return false;
+    }
 
     const uint32_t outW = displayW_;
     const uint32_t outH = displayH_;
+    outFrame.isBgra = false;
+    outFrame.width = outW;
+    outFrame.height = outH;
+    outFrame.stride = outW;
+    outFrame.data.resize(static_cast<size_t>(outW) * outH * 3 / 2);
+
+    const uint8_t* srcY = static_cast<const uint8_t*>(mapped.pData);
+    const uint8_t* srcUV = srcY + static_cast<size_t>(mapped.RowPitch) * td.Height;
+    for (uint32_t r = 0; r < outH; ++r) {
+        std::memcpy(outFrame.data.data() + static_cast<size_t>(r) * outW, srcY + static_cast<size_t>(r) * mapped.RowPitch, outW);
+    }
+    uint8_t* dstUV = outFrame.data.data() + static_cast<size_t>(outW) * outH;
+    for (uint32_t r = 0; r < outH / 2; ++r) {
+        std::memcpy(dstUV + static_cast<size_t>(r) * outW, srcUV + static_cast<size_t>(r) * mapped.RowPitch, outW);
+    }
+
+    dxvaCtx_->Unmap(dxvaStagingTex_.Get(), 0);
+    return true;
+}
+
+bool VideoDecoder::ReadH264OutputSample(IMFSample* sample, DecodedFrame& outFrame) {
+    const uint32_t outW = displayW_;
+    const uint32_t outH = displayH_;
     if (outW < 16 || outH < 16) return false;
+
+    if (usingDxva_) {
+        ComPtr<IMFMediaBuffer> rawBuf;
+        ComPtr<IMFDXGIBuffer> dxgiBuf;
+        if (SUCCEEDED(sample->GetBufferByIndex(0, &rawBuf)) && SUCCEEDED(rawBuf.As(&dxgiBuf))) {
+            ComPtr<ID3D11Texture2D> surfTex;
+            UINT subIdx = 0;
+            if (SUCCEEDED(dxgiBuf->GetResource(IID_PPV_ARGS(&surfTex))) &&
+                SUCCEEDED(dxgiBuf->GetSubresourceIndex(&subIdx)) &&
+                CopyDxgiSurfaceToNv12(surfTex.Get(), subIdx, outFrame)) {
+                return true;
+            }
+        }
+    }
+
+    ComPtr<IMFMediaBuffer> buf;
+    if (FAILED(sample->ConvertToContiguousBuffer(&buf))) return false;
 
     outFrame.isBgra = false;
     outFrame.width = outW;
@@ -298,13 +457,12 @@ bool VideoDecoder::DecodeMjpeg(const uint8_t* jpegData, size_t size, DecodedFram
     outFrame.width = w;
     outFrame.height = h;
     outFrame.stride = w * 4u;
-    outFrame.data.resize(static_cast<size_t>(outFrame.stride) * h);
+    outFrame.data.resize(static_cast<size_t>(w) * h * 4u);
 
-    return SUCCEEDED(converter->CopyPixels(
-        nullptr,
-        outFrame.stride,
-        static_cast<UINT>(outFrame.data.size()),
-        outFrame.data.data()));
+    if (FAILED(converter->CopyPixels(nullptr, outFrame.stride, static_cast<UINT>(outFrame.data.size()), outFrame.data.data()))) {
+        return false;
+    }
+    return true;
 }
 
 } // namespace phonecam

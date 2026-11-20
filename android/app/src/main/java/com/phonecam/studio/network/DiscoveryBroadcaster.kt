@@ -6,6 +6,7 @@ import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.Inet4Address
 import java.net.InetAddress
+import java.net.InetSocketAddress
 import java.net.NetworkInterface
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -15,11 +16,17 @@ class DiscoveryBroadcaster(
     private val isStreaming: () -> Boolean
 ) {
     private val running = AtomicBoolean(false)
-    private var thread: Thread? = null
+    private var broadcastThread: Thread? = null
+    private var probeResponderThread: Thread? = null
+    private var responderSocket: DatagramSocket? = null
 
     fun start() {
         if (running.getAndSet(true)) return
-        thread = Thread({ loop() }, "PhoneCam-Discovery").apply {
+        broadcastThread = Thread({ broadcastLoop() }, "PhoneCam-DiscoveryTx").apply {
+            isDaemon = true
+            start()
+        }
+        probeResponderThread = Thread({ probeResponderLoop() }, "PhoneCam-DiscoveryRx").apply {
             isDaemon = true
             start()
         }
@@ -27,23 +34,31 @@ class DiscoveryBroadcaster(
 
     fun stop() {
         running.set(false)
-        thread?.interrupt()
-        thread = null
+        broadcastThread?.interrupt()
+        broadcastThread = null
+        try {
+            responderSocket?.close()
+        } catch (_: Exception) {}
+        responderSocket = null
+        probeResponderThread = null
     }
 
-    private fun loop() {
+    private fun buildPayload(): ByteArray {
+        return Protocol.buildDiscoveryJson(
+            deviceName = "${Build.MANUFACTURER} ${Build.MODEL}".trim(),
+            pinRequired = getPinRequired(),
+            facing = getFacing(),
+            streaming = isStreaming()
+        ).toByteArray(Charsets.UTF_8)
+    }
+
+    private fun broadcastLoop() {
         var socket: DatagramSocket? = null
         try {
             socket = DatagramSocket().apply { broadcast = true }
             while (running.get()) {
                 try {
-                    val payload = Protocol.buildDiscoveryJson(
-                        deviceName = "${Build.MANUFACTURER} ${Build.MODEL}".trim(),
-                        pinRequired = getPinRequired(),
-                        facing = getFacing(),
-                        streaming = isStreaming()
-                    ).toByteArray(Charsets.UTF_8)
-
+                    val payload = buildPayload()
                     val targets = collectBroadcastAddresses()
                     for (addr in targets) {
                         val pkt = DatagramPacket(payload, payload.size, addr, Protocol.UDP_DISCOVERY_PORT)
@@ -60,9 +75,33 @@ class DiscoveryBroadcaster(
                 }
             }
         } catch (_: Exception) {
-            // Socket setup failure
         } finally {
             socket?.close()
+        }
+    }
+
+    private fun probeResponderLoop() {
+        try {
+            val sock = DatagramSocket(null).apply {
+                reuseAddress = true
+                bind(InetSocketAddress(Protocol.UDP_DISCOVERY_PORT))
+                soTimeout = 1000
+            }
+            responderSocket = sock
+            val buf = ByteArray(512)
+            while (running.get()) {
+                try {
+                    val rx = DatagramPacket(buf, buf.size)
+                    sock.receive(rx)
+                    val text = String(rx.data, 0, rx.length, Charsets.UTF_8)
+                    if (text.contains("PCAM_PROBE")) {
+                        val payload = buildPayload()
+                        val reply = DatagramPacket(payload, payload.size, rx.address, rx.port)
+                        sock.send(reply)
+                    }
+                } catch (_: Exception) {}
+            }
+        } catch (_: Exception) {
         }
     }
 

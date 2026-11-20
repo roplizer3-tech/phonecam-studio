@@ -26,6 +26,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.BatteryChargingFull
+import androidx.compose.material.icons.rounded.Bluetooth
 import androidx.compose.material.icons.rounded.Cameraswitch
 import androidx.compose.material.icons.rounded.DarkMode
 import androidx.compose.material.icons.rounded.FlashOff
@@ -179,7 +180,10 @@ fun MainScreen(
                                 Text(
                                     text = when {
                                         snapshot.clientStatus.connected ->
-                                            t("متصل بـ ${snapshot.clientStatus.clientAddress}", "Connected: ${snapshot.clientStatus.clientAddress}")
+                                            t(
+                                                "متصل (${snapshot.clientStatus.transport}): ${snapshot.clientStatus.clientAddress}",
+                                                "Connected (${snapshot.clientStatus.transport}): ${snapshot.clientStatus.clientAddress}"
+                                            )
                                         snapshot.isStreaming ->
                                             t("جاري البث — في انتظار ويندوز", "Streaming — Waiting for Windows PC")
                                         else ->
@@ -239,6 +243,14 @@ fun MainScreen(
                                     color = Color(0xFFE2E8F0),
                                     fontSize = 12.sp
                                 )
+                                if (snapshot.bluetoothReady) {
+                                    Icon(
+                                        imageVector = Icons.Rounded.Bluetooth,
+                                        contentDescription = "Bluetooth Ready",
+                                        tint = Color(0xFF38BDF8),
+                                        modifier = Modifier.size(15.dp)
+                                    )
+                                }
                             }
 
                             if (snapshot.pinEnabled) {

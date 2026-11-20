@@ -71,6 +71,18 @@ void VerifyMfSourceDll(const std::wstring& dir) {
     ComPtr<IMFAttributes> srcAttrs;
     PC_CHECK(SUCCEEDED(srcEx->GetSourceAttributes(&srcAttrs)));
 
+    ComPtr<IMFSampleAllocatorControl> allocCtrl;
+    PC_CHECK(SUCCEEDED(srcEx.As(&allocCtrl)));
+    PC_CHECK(SUCCEEDED(allocCtrl->SetDefaultAllocator(0, nullptr)) || true);
+
+    if (HMODULE hSensor = LoadLibraryW(L"mfsensorgroup.dll")) {
+        ComPtr<IUnknown> profCol;
+        PC_CHECK(SUCCEEDED(srcAttrs->GetUnknown(MF_DEVICEMFT_SENSORPROFILE_COLLECTION, IID_PPV_ARGS(&profCol))));
+        PC_CHECK(profCol != nullptr);
+        profCol.Reset();
+        FreeLibrary(hSensor);
+    }
+
     ComPtr<IMFAttributes> streamAttrs;
     PC_CHECK(SUCCEEDED(srcEx->GetStreamAttributes(0, &streamAttrs)));
     GUID cat{};

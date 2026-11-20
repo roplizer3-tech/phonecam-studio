@@ -1,5 +1,8 @@
 package com.phonecam.studio
 
+import com.phonecam.studio.camera.StreamConfig
+import com.phonecam.studio.network.GopSafeFrameQueue
+import com.phonecam.studio.network.OutboundPacket
 import com.phonecam.studio.protocol.Protocol
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -7,6 +10,7 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.util.UUID
 
 class ProtocolAndOrientationTest {
 
@@ -94,5 +98,37 @@ class ProtocolAndOrientationTest {
         val disc = Protocol.buildDiscoveryJson("TestPhone", false, "front", true)
         assertTrue(disc.contains("PCAM_DISC"))
         assertTrue(disc.contains("54820"))
+    }
+
+    @Test
+    fun bluetoothServiceUuidAndDefaultConfigAreValid() {
+        val uuid = UUID.fromString(Protocol.BLUETOOTH_SERVICE_UUID)
+        assertNotNull(uuid)
+        val cfg = StreamConfig()
+        assertEquals(60, cfg.fps)
+        assertEquals(1280, cfg.width)
+        assertEquals(720, cfg.height)
+    }
+
+    @Test
+    fun gopSafeQueueDropsCleanlyAndRecoversAtNextKeyframe() {
+        val queue = GopSafeFrameQueue(maxQueuedFrames = 3)
+        val sps = OutboundPacket(Protocol.TYPE_VIDEO_H264, Protocol.FLAG_CODEC_CONFIG, byteArrayOf(1), 1L)
+        val idr = OutboundPacket(Protocol.TYPE_VIDEO_H264, Protocol.FLAG_KEYFRAME, byteArrayOf(2), 2L)
+        val pFrame = OutboundPacket(Protocol.TYPE_VIDEO_H264, 0, byteArrayOf(3), 3L)
+
+        assertFalse(queue.enqueue(sps))
+        assertFalse(queue.enqueue(idr))
+        assertFalse(queue.enqueue(pFrame))
+        // Queue size is now 3 -> overflowing with a P-frame flushes stale P-frames, keeps SPS/PPS, and triggers awaitingKeyframe
+        assertTrue(queue.enqueue(pFrame))
+        assertTrue(queue.awaitingKeyframe)
+        // Trailing P-frame must be skipped while awaitingKeyframe
+        assertFalse(queue.enqueue(pFrame))
+        assertTrue(queue.awaitingKeyframe)
+        // Next IDR keyframe resumes queue cleanly
+        assertFalse(queue.enqueue(idr))
+        assertFalse(queue.awaitingKeyframe)
+        assertEquals(2, queue.size()) // preserved SPS/PPS + new IDR
     }
 }

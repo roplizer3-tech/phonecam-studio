@@ -1,5 +1,5 @@
 #ifndef MyAppVersion
-  #define MyAppVersion "1.0.0"
+  #define MyAppVersion "2.0.0"
 #endif
 
 [Setup]
@@ -42,8 +42,19 @@ Filename: "icacls.exe"; Parameters: """{commonappdata}\PhoneCamStudio"" /grant "
 Filename: "icacls.exe"; Parameters: """{app}"" /grant ""*S-1-5-19:(OI)(CI)(RX)"" /grant ""*S-1-15-2-1:(OI)(CI)(RX)"" /T /C"; Flags: runhidden waituntilterminated
 Filename: "regsvr32.exe"; Parameters: "/s ""{app}\PhoneCamMFSource.dll"""; Flags: runhidden waituntilterminated
 Filename: "regsvr32.exe"; Parameters: "/s ""{app}\PhoneCamDSFilter.dll"""; Flags: runhidden waituntilterminated
+Filename: "{app}\PhoneCamVcamSetup.exe"; Parameters: "--install"; Flags: runhidden waituntilterminated
+Filename: "netsh.exe"; Parameters: "advfirewall firewall delete rule name=""PhoneCam Studio TCP"""; Flags: runhidden waituntilterminated
+Filename: "netsh.exe"; Parameters: "advfirewall firewall delete rule name=""PhoneCam Studio UDP Discovery"""; Flags: runhidden waituntilterminated
+Filename: "netsh.exe"; Parameters: "advfirewall firewall delete rule name=""PhoneCam Studio Outbound"""; Flags: runhidden waituntilterminated
+Filename: "netsh.exe"; Parameters: "advfirewall firewall add rule name=""PhoneCam Studio TCP"" dir=in action=allow protocol=TCP localport=54820 program=""{app}\PhoneCamStudio.exe"" enable=yes"; Flags: runhidden waituntilterminated
+Filename: "netsh.exe"; Parameters: "advfirewall firewall add rule name=""PhoneCam Studio UDP Discovery"" dir=in action=allow protocol=UDP localport=54821 program=""{app}\PhoneCamStudio.exe"" enable=yes"; Flags: runhidden waituntilterminated
+Filename: "netsh.exe"; Parameters: "advfirewall firewall add rule name=""PhoneCam Studio Outbound"" dir=out action=allow program=""{app}\PhoneCamStudio.exe"" enable=yes"; Flags: runhidden waituntilterminated
 Filename: "{app}\PhoneCamStudio.exe"; Description: "{cm:LaunchProgram,PhoneCam Studio}"; Flags: nowait postinstall skipifsilent runasoriginaluser
 
 [UninstallRun]
+Filename: "{app}\PhoneCamVcamSetup.exe"; Parameters: "--uninstall"; Flags: runhidden waituntilterminated; RunOnceId: "UnregPhoneCamSysVcam"
 Filename: "regsvr32.exe"; Parameters: "/u /s ""{app}\PhoneCamMFSource.dll"""; Flags: runhidden waituntilterminated; RunOnceId: "UnregPhoneCamMF"
 Filename: "regsvr32.exe"; Parameters: "/u /s ""{app}\PhoneCamDSFilter.dll"""; Flags: runhidden waituntilterminated; RunOnceId: "UnregPhoneCamDS"
+Filename: "netsh.exe"; Parameters: "advfirewall firewall delete rule name=""PhoneCam Studio TCP"""; Flags: runhidden waituntilterminated; RunOnceId: "UnregPhoneCamFwTcp"
+Filename: "netsh.exe"; Parameters: "advfirewall firewall delete rule name=""PhoneCam Studio UDP Discovery"""; Flags: runhidden waituntilterminated; RunOnceId: "UnregPhoneCamFwUdp"
+Filename: "netsh.exe"; Parameters: "advfirewall firewall delete rule name=""PhoneCam Studio Outbound"""; Flags: runhidden waituntilterminated; RunOnceId: "UnregPhoneCamFwOut"

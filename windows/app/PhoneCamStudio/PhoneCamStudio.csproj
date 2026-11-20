@@ -12,7 +12,7 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <AssemblyName>PhoneCamStudio</AssemblyName>
     <RootNamespace>PhoneCamStudio</RootNamespace>
-    <Version>1.0.0</Version>
+    <Version>2.0.0</Version>
     <Product>PhoneCam Studio</Product>
   </PropertyGroup>
 

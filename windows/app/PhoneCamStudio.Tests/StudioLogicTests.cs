@@ -14,21 +14,30 @@ public class StudioLogicTests
     [Fact]
     public void VideoParamsInteropStructMatchesNativeAbiSize()
     {
-        // 12 ints (48 bytes) + 21 floats (84 bytes) = 132 bytes
-        Assert.Equal(132, Marshal.SizeOf<PC_VideoParams>());
+        // 16 ints (64 bytes) + 27 floats (108 bytes) = 172 bytes
+        Assert.Equal(172, Marshal.SizeOf<PC_VideoParams>());
     }
 
     [Fact]
-    public void BuiltInPresetsContain12ValidProfiles()
+    public void BuiltInPresetsContain16ValidProfilesWithRealAiAndShaderEffects()
     {
-        Assert.Equal(12, PresetCatalog.BuiltInPresets.Count);
+        Assert.Equal(16, PresetCatalog.BuiltInPresets.Count);
+        bool sawAiBg = false, sawStyle = false, sawAr = false, sawFaceSculpt = false;
         foreach (var preset in PresetCatalog.BuiltInPresets)
         {
             Assert.False(string.IsNullOrWhiteSpace(preset.Id));
             Assert.False(string.IsNullOrWhiteSpace(preset.NameAr));
             Assert.False(string.IsNullOrWhiteSpace(preset.NameEn));
             Assert.True(preset.IsBuiltIn);
+            if (preset.Settings.BgMode > 0) sawAiBg = true;
+            if (preset.Settings.StyleFilterMode > 0) sawStyle = true;
+            if (preset.Settings.ArFilterMode > 0) sawAr = true;
+            if (preset.Settings.FaceSlim > 0f && preset.Settings.EyeEnlarge > 0f) sawFaceSculpt = true;
         }
+        Assert.True(sawAiBg);
+        Assert.True(sawStyle);
+        Assert.True(sawAr);
+        Assert.True(sawFaceSculpt);
     }
 
     [Fact]

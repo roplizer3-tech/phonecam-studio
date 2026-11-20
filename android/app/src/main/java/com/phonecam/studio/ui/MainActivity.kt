@@ -109,6 +109,7 @@ class MainActivity : ComponentActivity() {
                     hasCameraPerm = grants[Manifest.permission.CAMERA] == true ||
                         ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) ==
                         PackageManager.PERMISSION_GRANTED
+                    service?.refreshBluetoothAvailability()
                 }
 
                 LaunchedEffect(Unit) {
@@ -119,6 +120,12 @@ class MainActivity : ComponentActivity() {
                         PackageManager.PERMISSION_GRANTED
                     ) {
                         needed.add(Manifest.permission.POST_NOTIFICATIONS)
+                    }
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+                        ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.BLUETOOTH_CONNECT) !=
+                        PackageManager.PERMISSION_GRANTED
+                    ) {
+                        needed.add(Manifest.permission.BLUETOOTH_CONNECT)
                     }
                     if (needed.isNotEmpty()) {
                         permLauncher.launch(needed.toTypedArray())

@@ -8,6 +8,7 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.net.wifi.WifiManager
 import android.os.BatteryManager
 import android.os.Binder
 import android.os.Build
@@ -20,6 +21,7 @@ import com.phonecam.studio.camera.CameraStreamEngine
 import com.phonecam.studio.camera.EncodedFrameListener
 import com.phonecam.studio.camera.StreamConfig
 import com.phonecam.studio.camera.VideoCodecMode
+import com.phonecam.studio.network.BluetoothServer
 import com.phonecam.studio.network.ClientStatus
 import com.phonecam.studio.network.DiscoveryBroadcaster
 import com.phonecam.studio.network.StreamServer
@@ -46,6 +48,8 @@ data class ServiceSnapshot(
     val pinEnabled: Boolean = true,
     val localIps: List<String> = emptyList(),
     val batteryPct: Int = 100,
+    val bluetoothReady: Boolean = false,
+    val nativeWebcamSupported: Boolean = false,
     val lastError: String? = null
 )
 
@@ -71,8 +75,10 @@ class CameraForegroundService : Service() {
 
     private lateinit var cameraEngine: CameraStreamEngine
     private lateinit var streamServer: StreamServer
+    private lateinit var bluetoothServer: BluetoothServer
     private lateinit var discovery: DiscoveryBroadcaster
     private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
     private var scheduler: ScheduledExecutorService? = null
 
     override fun onCreate() {
@@ -89,6 +95,7 @@ class CameraForegroundService : Service() {
                     timestampMs: Long
                 ) {
                     streamServer.sendVideoFrame(packetType, flags, data, timestampMs)
+                    bluetoothServer.sendVideoFrame(packetType, flags, data, timestampMs)
                 }
 
                 override fun onEngineError(message: String) {
@@ -96,6 +103,10 @@ class CameraForegroundService : Service() {
                 }
             }
         )
+
+        val onClientStatus: (ClientStatus) -> Unit = { status ->
+            _state.value = _state.value.copy(clientStatus = status)
+        }
 
         streamServer = StreamServer(
             getPin = {
@@ -105,9 +116,19 @@ class CameraForegroundService : Service() {
             getCameras = { cameraEngine.refreshCatalog() },
             getCodecConfig = { cameraEngine.cachedCodecConfig },
             onControlCommand = { cmd -> handleRemoteCommand(cmd) },
-            onClientChanged = { status ->
-                _state.value = _state.value.copy(clientStatus = status)
-            }
+            onClientChanged = onClientStatus
+        )
+
+        bluetoothServer = BluetoothServer(
+            context = this,
+            getPin = {
+                val s = _state.value
+                if (s.pinEnabled) s.pinCode else ""
+            },
+            getCameras = { cameraEngine.refreshCatalog() },
+            getCodecConfig = { cameraEngine.cachedCodecConfig },
+            onControlCommand = { cmd -> handleRemoteCommand(cmd) },
+            onClientChanged = onClientStatus
         )
 
         discovery = DiscoveryBroadcaster(
@@ -143,11 +164,16 @@ class CameraForegroundService : Service() {
     fun startStreaming() {
         if (_state.value.isStreaming) return
         startForeground(NOTIF_ID, buildNotification())
-        acquireWakeLock()
+        acquireLocks()
         streamServer.start()
+        val btOk = bluetoothServer.start()
         cameraEngine.start(_state.value.config)
         startTelemetryTimer()
-        _state.value = _state.value.copy(isStreaming = true, lastError = null)
+        _state.value = _state.value.copy(
+            isStreaming = true,
+            bluetoothReady = btOk,
+            lastError = null
+        )
         syncSnapshot()
     }
 
@@ -156,14 +182,25 @@ class CameraForegroundService : Service() {
         stopTelemetryTimer()
         cameraEngine.stop()
         streamServer.stop()
-        releaseWakeLock()
+        bluetoothServer.stop()
+        releaseLocks()
         stopForeground(STOP_FOREGROUND_REMOVE)
         _state.value = _state.value.copy(
             isStreaming = false,
+            bluetoothReady = false,
             clientStatus = ClientStatus(false),
             torchEnabled = false
         )
         syncSnapshot()
+    }
+
+    fun refreshBluetoothAvailability() {
+        if (_state.value.isStreaming && !bluetoothServer.hasPermissionAndEnabled()) {
+            _state.value = _state.value.copy(bluetoothReady = false)
+        } else if (_state.value.isStreaming) {
+            val btOk = bluetoothServer.start()
+            _state.value = _state.value.copy(bluetoothReady = btOk)
+        }
     }
 
     fun setPreviewSurface(surface: Surface?) {
@@ -271,14 +308,15 @@ class CameraForegroundService : Service() {
             put("facing", cam.facing)
             put("sensorOrientation", cam.sensorOrientation)
             put("uprightRotation", cameraEngine.currentUprightRotation())
-            put("width", snap.config.width)
-            put("height", snap.config.height)
+            put("width", cameraEngine.activeSize.width)
+            put("height", cameraEngine.activeSize.height)
             put("fps", snap.config.fps)
             put("batteryPct", snap.batteryPct)
             put("torchOn", snap.torchEnabled)
             put("codec", snap.config.codec.name.lowercase())
         }.toString()
         streamServer.sendTelemetry(json)
+        bluetoothServer.sendTelemetry(json)
     }
 
     private fun syncSnapshot() {
@@ -289,7 +327,9 @@ class CameraForegroundService : Service() {
             torchEnabled = cameraEngine.torchEnabled,
             zoomRatio = cameraEngine.zoomRatio,
             localIps = DiscoveryBroadcaster.getLocalIpv4Addresses(),
-            batteryPct = readBatteryPct()
+            batteryPct = readBatteryPct(),
+            bluetoothReady = _state.value.isStreaming && bluetoothServer.hasPermissionAndEnabled(),
+            nativeWebcamSupported = CameraStreamEngine.supportsNativeUsbWebcam(this)
         )
     }
 
@@ -300,7 +340,8 @@ class CameraForegroundService : Service() {
         return if (level >= 0 && scale > 0) (level * 100) / scale else 100
     }
 
-    private fun acquireWakeLock() {
+    @Suppress("DEPRECATION")
+    private fun acquireLocks() {
         if (wakeLock == null) {
             val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
             wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "PhoneCamStudio::StreamLock")
@@ -308,11 +349,26 @@ class CameraForegroundService : Service() {
         if (wakeLock?.isHeld == false) {
             wakeLock?.acquire(6 * 60 * 60 * 1000L)
         }
+        if (wifiLock == null) {
+            val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+            val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+            } else {
+                WifiManager.WIFI_MODE_FULL_HIGH_PERF
+            }
+            wifiLock = wm?.createWifiLock(mode, "PhoneCamStudio::WifiLowLatency")
+        }
+        if (wifiLock?.isHeld == false) {
+            wifiLock?.acquire()
+        }
     }
 
-    private fun releaseWakeLock() {
+    private fun releaseLocks() {
         try {
             if (wakeLock?.isHeld == true) wakeLock?.release()
+        } catch (_: Exception) {}
+        try {
+            if (wifiLock?.isHeld == true) wifiLock?.release()
         } catch (_: Exception) {}
     }
 
@@ -348,7 +404,7 @@ class CameraForegroundService : Service() {
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle(getString(R.string.notif_title_streaming))
-            .setContentText("Port 54820 • ${DiscoveryBroadcaster.getLocalIpv4Addresses().firstOrNull() ?: "USB/Wi-Fi"}")
+            .setContentText("Port 54820 • ${DiscoveryBroadcaster.getLocalIpv4Addresses().firstOrNull() ?: "USB/Wi-Fi/BT"}")
             .setContentIntent(openPending)
             .setOngoing(true)
             .addAction(0, getString(R.string.notif_action_stop), stopPending)

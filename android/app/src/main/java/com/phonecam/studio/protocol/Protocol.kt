@@ -10,6 +10,8 @@ import java.security.SecureRandom
 object Protocol {
     const val TCP_PORT = 54820
     const val UDP_DISCOVERY_PORT = 54821
+    const val BLUETOOTH_SERVICE_UUID = "7a9e4b21-6c3d-4f18-9e2a-51b8c4d730f9"
+    const val BLUETOOTH_SERVICE_NAME = "PhoneCam Studio"
     const val MAGIC: Int = 0x5043414D // "PCAM" LE
     const val HEADER_SIZE = 16
     const val MAX_PAYLOAD_BYTES = 8 * 1024 * 1024

@@ -90,6 +90,25 @@ public partial class MainWindow : Window
     }
 
     private void OnConnectUsbClick(object sender, RoutedEventArgs e) => _vm.ConnectUsb();
+    private void OnRefreshUsbBtClick(object sender, RoutedEventArgs e) => _vm.RefreshUsbAndBluetooth();
+    private void OnConnectBluetoothClick(object sender, RoutedEventArgs e)
+    {
+        if (sender is System.Windows.Controls.Button b && b.Tag is BluetoothPhoneItem bt)
+        {
+            _vm.ConnectBluetooth(bt.Address);
+        }
+    }
+    private void OnBrowseCustomBgClick(object sender, RoutedEventArgs e)
+    {
+        var dlg = new Microsoft.Win32.OpenFileDialog
+        {
+            Filter = "Images (*.jpg;*.jpeg;*.png;*.bmp;*.webp)|*.jpg;*.jpeg;*.png;*.bmp;*.webp|All Files (*.*)|*.*"
+        };
+        if (dlg.ShowDialog(this) == true)
+        {
+            _vm.SetCustomBackgroundFile(dlg.FileName);
+        }
+    }
     private void OnConnectManualClick(object sender, RoutedEventArgs e) => _vm.ConnectWifi();
     private void OnDisconnectClick(object sender, RoutedEventArgs e) => _vm.Disconnect();
 

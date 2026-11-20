@@ -42,25 +42,63 @@ jobs:
           Write-Host "Using Windows 11 SDK: $chosen"
           "version=$chosen" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
+      - name: Download ONNX Runtime DirectML, DirectML, ADB Platform-Tools & AI Models
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path "deps/ort", "deps/dml", "deps/platform-tools", "deps/models" | Out-Null
+
+          Invoke-WebRequest -Uri "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime.directml/1.20.1/microsoft.ml.onnxruntime.directml.1.20.1.nupkg" -OutFile "deps/ort.zip"
+          Expand-Archive -Path "deps/ort.zip" -DestinationPath "deps/ort" -Force
+
+          Invoke-WebRequest -Uri "https://api.nuget.org/v3-flatcontainer/microsoft.ai.directml/1.15.4/microsoft.ai.directml.1.15.4.nupkg" -OutFile "deps/dml.zip"
+          Expand-Archive -Path "deps/dml.zip" -DestinationPath "deps/dml" -Force
+
+          Invoke-WebRequest -Uri "https://dl.google.com/android/repository/platform-tools-latest-windows.zip" -OutFile "deps/platform-tools.zip"
+          Expand-Archive -Path "deps/platform-tools.zip" -DestinationPath "deps/pt-tmp" -Force
+          Copy-Item "deps/pt-tmp/platform-tools/*" "deps/platform-tools/" -Recurse -Force
+
+          Invoke-WebRequest -Uri "https://huggingface.co/onnx-community/mediapipe_selfie_segmentation/resolve/main/onnx/model.onnx" -OutFile "deps/models/selfie_segmentation.onnx"
+          Invoke-WebRequest -Uri "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx" -OutFile "deps/models/face_detection_yunet_2023mar.onnx"
+
+          foreach ($req in @(
+            "deps/ort/runtimes/win-x64/native/onnxruntime.lib",
+            "deps/ort/runtimes/win-x64/native/onnxruntime.dll",
+            "deps/dml/bin/x64-win/DirectML.dll",
+            "deps/platform-tools/adb.exe",
+            "deps/platform-tools/AdbWinApi.dll",
+            "deps/platform-tools/AdbWinUsbApi.dll",
+            "deps/models/selfie_segmentation.onnx",
+            "deps/models/face_detection_yunet_2023mar.onnx"
+          )) {
+            if (-not (Test-Path $req) -or ((Get-Item $req).Length -lt 1024)) {
+              throw "Missing or empty downloaded dependency: $req"
+            }
+          }
+
       - name: Configure & Build Native C++20 Engine and Virtual Cameras
         shell: pwsh
         run: |
           cmake --version
+          $ortRoot = (Resolve-Path "deps/ort").Path.Replace('\', '/')
+          $dmlRoot = (Resolve-Path "deps/dml").Path.Replace('\', '/')
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           $instVer = if (Test-Path $vswhere) { (& $vswhere -latest -property installationVersion | Select-Object -First 1) } else { "" }
           Write-Host "Detected VS installationVersion: $instVer"
           if ($instVer -match '^18\.') {
-            cmake -S windows/native -B windows/native/build -G "Visual Studio 18 2026" -A x64 -DCMAKE_SYSTEM_VERSION="${{ steps.winsdk.outputs.version }}"
+            cmake -S windows/native -B windows/native/build -G "Visual Studio 18 2026" -A x64 -DCMAKE_SYSTEM_VERSION="${{ steps.winsdk.outputs.version }}" -DORT_ROOT="$ortRoot" -DDML_ROOT="$dmlRoot"
           } elseif ($instVer -match '^17\.') {
-            cmake -S windows/native -B windows/native/build -G "Visual Studio 17 2022" -A x64 -DCMAKE_SYSTEM_VERSION="${{ steps.winsdk.outputs.version }}"
+            cmake -S windows/native -B windows/native/build -G "Visual Studio 17 2022" -A x64 -DCMAKE_SYSTEM_VERSION="${{ steps.winsdk.outputs.version }}" -DORT_ROOT="$ortRoot" -DDML_ROOT="$dmlRoot"
           } else {
-            cmake -S windows/native -B windows/native/build -A x64 -DCMAKE_SYSTEM_VERSION="${{ steps.winsdk.outputs.version }}"
+            cmake -S windows/native -B windows/native/build -A x64 -DCMAKE_SYSTEM_VERSION="${{ steps.winsdk.outputs.version }}" -DORT_ROOT="$ortRoot" -DDML_ROOT="$dmlRoot"
           }
           cmake --build windows/native/build --config Release --parallel
 
-      - name: Run Native C++ CTest Suite (Protocol, SharedBuffer, D3D11 WARP Shaders, COM)
+      - name: Run Native C++ CTest Suite (Protocol, SharedBuffer, AI ONNX, D3D11 WARP Shaders, COM)
         shell: pwsh
-        run: ctest --test-dir windows/native/build -C Release --output-on-failure
+        run: |
+          $env:PHONECAM_TEST_MODELS_DIR = (Resolve-Path "deps/models").Path
+          ctest --test-dir windows/native/build -C Release --output-on-failure
 
       - name: Smoke-test COM Virtual Camera Registration (regsvr32)
         shell: pwsh
@@ -95,6 +133,15 @@ jobs:
           Copy-Item "windows/native/build/Release/PhoneCamEngine.dll" "dist/PhoneCamStudio/"
           Copy-Item "windows/native/build/Release/PhoneCamMFSource.dll" "dist/PhoneCamStudio/"
           Copy-Item "windows/native/build/Release/PhoneCamDSFilter.dll" "dist/PhoneCamStudio/"
+          Copy-Item "windows/native/build/Release/PhoneCamVcamSetup.exe" "dist/PhoneCamStudio/"
+          Copy-Item "deps/ort/runtimes/win-x64/native/onnxruntime.dll" "dist/PhoneCamStudio/"
+          Copy-Item "deps/dml/bin/x64-win/DirectML.dll" "dist/PhoneCamStudio/"
+          New-Item -ItemType Directory -Force -Path "dist/PhoneCamStudio/models", "dist/PhoneCamStudio/tools/adb" | Out-Null
+          Copy-Item "deps/models/selfie_segmentation.onnx" "dist/PhoneCamStudio/models/"
+          Copy-Item "deps/models/face_detection_yunet_2023mar.onnx" "dist/PhoneCamStudio/models/"
+          Copy-Item "deps/platform-tools/adb.exe" "dist/PhoneCamStudio/tools/adb/"
+          Copy-Item "deps/platform-tools/AdbWinApi.dll" "dist/PhoneCamStudio/tools/adb/"
+          Copy-Item "deps/platform-tools/AdbWinUsbApi.dll" "dist/PhoneCamStudio/tools/adb/"
           Copy-Item "windows/installer/Install-VirtualCam.bat" "dist/PhoneCamStudio/"
           Copy-Item "windows/installer/Uninstall-VirtualCam.bat" "dist/PhoneCamStudio/"
 
@@ -104,7 +151,7 @@ jobs:
           choco install innosetup -y --no-progress
           $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
           if (-not (Test-Path $iscc)) { throw "ISCC.exe not found at $iscc" }
-          & $iscc /DMyAppVersion=1.0.0 windows/installer/PhoneCamStudio.iss
+          & $iscc /DMyAppVersion=2.0.0 windows/installer/PhoneCamStudio.iss
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
           Compress-Archive -Path "dist/PhoneCamStudio/*" -DestinationPath "dist/PhoneCamStudio-Portable-x64.zip" -Force
           Get-ChildItem dist/ | Format-Table Name, Length

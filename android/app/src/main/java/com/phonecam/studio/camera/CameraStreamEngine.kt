@@ -2,6 +2,7 @@ package com.phonecam.studio.camera
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.content.pm.PackageManager
 import android.graphics.ImageFormat
 import android.graphics.Rect
 import android.graphics.YuvImage
@@ -14,6 +15,7 @@ import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.params.MeteringRectangle
 import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.SessionConfiguration
+import android.hardware.camera2.params.StreamConfigurationMap
 import android.media.Image
 import android.media.ImageReader
 import android.media.MediaCodec
@@ -25,6 +27,7 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.util.Log
 import android.util.Range
+import android.util.Size
 import android.view.Surface
 import com.phonecam.studio.protocol.Protocol
 import com.phonecam.studio.protocol.Protocol.CameraDescriptor
@@ -32,14 +35,15 @@ import java.io.ByteArrayOutputStream
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.math.abs
 
 enum class VideoCodecMode { H264, MJPEG }
 
 data class StreamConfig(
     val width: Int = 1280,
     val height: Int = 720,
-    val fps: Int = 30,
-    val bitrateBps: Int = 4_000_000,
+    val fps: Int = 60,
+    val bitrateBps: Int = 4_500_000,
     val codec: VideoCodecMode = VideoCodecMode.H264
 )
 
@@ -60,6 +64,18 @@ class CameraStreamEngine(
 ) {
     companion object {
         private const val TAG = "CameraStreamEngine"
+
+        fun supportsNativeUsbWebcam(ctx: Context): Boolean {
+            if (Build.VERSION.SDK_INT < 34) return false
+            return try {
+                ctx.packageManager.getPackageInfo("com.android.DeviceAsWebcam", 0)
+                true
+            } catch (_: PackageManager.NameNotFoundException) {
+                false
+            } catch (_: Exception) {
+                false
+            }
+        }
     }
 
     private val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
@@ -92,6 +108,10 @@ class CameraStreamEngine(
 
     @Volatile
     var config: StreamConfig = StreamConfig()
+        private set
+
+    @Volatile
+    var activeSize: Size = Size(1280, 720)
         private set
 
     @Volatile
@@ -174,8 +194,8 @@ class CameraStreamEngine(
         val sanitized = newConfig.copy(
             width = newConfig.width.coerceIn(320, 1920),
             height = newConfig.height.coerceIn(240, 1080),
-            fps = if (newConfig.fps >= 45) 60 else 30,
-            bitrateBps = newConfig.bitrateBps.coerceIn(500_000, 16_000_000)
+            fps = newConfig.fps.coerceIn(15, 60),
+            bitrateBps = newConfig.bitrateBps.coerceIn(400_000, 16_000_000)
         )
         if (sanitized == config) return
         config = sanitized
@@ -271,6 +291,23 @@ class CameraStreamEngine(
         createSession(dev)
     }
 
+    private fun chooseSupportedVideoSize(chars: CameraCharacteristics?, desiredW: Int, desiredH: Int): Size {
+        val map: StreamConfigurationMap = chars?.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            ?: return Size(desiredW, desiredH)
+        val sizes = map.getOutputSizes(MediaCodec::class.java)
+            ?: map.getOutputSizes(ImageFormat.YUV_420_888)
+            ?: return Size(desiredW, desiredH)
+
+        val candidates = sizes.filter { it.width >= 320 && it.height >= 240 && it.width <= 1920 && it.height <= 1080 }
+        if (candidates.isEmpty()) return Size(desiredW, desiredH)
+
+        return candidates.minByOrNull { s ->
+            val areaDiff = abs(s.width * s.height - desiredW * desiredH)
+            val aspectPenalty = abs((s.width.toFloat() / s.height) - (desiredW.toFloat() / desiredH)) * 500_000f
+            areaDiff + aspectPenalty.toInt()
+        } ?: Size(desiredW, desiredH)
+    }
+
     @SuppressLint("MissingPermission")
     private fun openSelectedCamera() {
         val cam = currentCamera ?: run {
@@ -280,7 +317,8 @@ class CameraStreamEngine(
         try {
             currentCharacteristics = cameraManager.getCameraCharacteristics(cam.id)
             activeArrayRect = currentCharacteristics?.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
-            setupEncoder()
+            activeSize = chooseSupportedVideoSize(currentCharacteristics, config.width, config.height)
+            setupEncoder(activeSize)
             cameraManager.openCamera(cam.id, object : CameraDevice.StateCallback() {
                 override fun onOpened(device: CameraDevice) {
                     synchronized(lock) {
@@ -308,19 +346,19 @@ class CameraStreamEngine(
                     listener.onEngineError("Camera2 error code: $error")
                 }
             }, cameraHandler)
-        } catch (e: SecurityException) {
+        } catch (_: SecurityException) {
             listener.onEngineError("Missing CAMERA permission")
         } catch (e: Exception) {
             listener.onEngineError("Failed opening camera: ${e.message}")
         }
     }
 
-    private fun setupEncoder() {
+    private fun setupEncoder(size: Size) {
         cachedCodecConfig = null
         if (config.codec == VideoCodecMode.MJPEG) {
             val reader = ImageReader.newInstance(
-                config.width,
-                config.height,
+                size.width,
+                size.height,
                 ImageFormat.YUV_420_888,
                 3
             )
@@ -337,32 +375,67 @@ class CameraStreamEngine(
         }
 
         val codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-        val format = createH264Format(config, lowLatencyHints = true)
-        try {
-            codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-        } catch (_: Exception) {
-            // Fallback without optional low-latency vendor keys on older SoCs
-            codec.configure(createH264Format(config, lowLatencyHints = false), null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+        val configured = tryConfigureCodec(codec, size, profileBaseline = true, lowLatencyHints = true)
+            || tryConfigureCodec(codec, size, profileBaseline = false, lowLatencyHints = true)
+            || tryConfigureCodec(codec, size, profileBaseline = false, lowLatencyHints = false)
+
+        if (!configured) {
+            codec.release()
+            listener.onEngineError("Failed configuring H.264 MediaCodec encoder")
+            return
         }
+
         codecInputSurface = codec.createInputSurface()
         codec.start()
         mediaCodec = codec
 
         encoderThread = Thread({ drainH264Encoder(codec) }, "PhoneCam-H264Drain").apply {
             isDaemon = true
+            priority = Thread.MAX_PRIORITY
             start()
         }
     }
 
-    private fun createH264Format(cfg: StreamConfig, lowLatencyHints: Boolean): MediaFormat {
-        return MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, cfg.width, cfg.height).apply {
+    private fun tryConfigureCodec(
+        codec: MediaCodec,
+        size: Size,
+        profileBaseline: Boolean,
+        lowLatencyHints: Boolean
+    ): Boolean {
+        return try {
+            val fmt = createH264Format(size, config, profileBaseline, lowLatencyHints)
+            codec.configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun createH264Format(
+        size: Size,
+        cfg: StreamConfig,
+        profileBaseline: Boolean,
+        lowLatencyHints: Boolean
+    ): MediaFormat {
+        return MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, size.width, size.height).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             setInteger(MediaFormat.KEY_BIT_RATE, cfg.bitrateBps)
             setInteger(MediaFormat.KEY_FRAME_RATE, cfg.fps)
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+            if (profileBaseline) {
+                setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
+                val level = if (size.width >= 1920) {
+                    MediaCodecInfo.CodecProfileLevel.AVCLevel4
+                } else {
+                    MediaCodecInfo.CodecProfileLevel.AVCLevel31
+                }
+                setInteger(MediaFormat.KEY_LEVEL, level)
+            }
             if (lowLatencyHints) {
                 setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
                 setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
+                setInteger(MediaFormat.KEY_OPERATING_RATE, cfg.fps)
+                setInteger(MediaFormat.KEY_PRIORITY, 0) // 0 = Realtime priority
                 setInteger("latency", 0)
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                     setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
@@ -411,7 +484,6 @@ class CameraStreamEngine(
                     try {
                         codec.releaseOutputBuffer(idx, false)
                     } catch (_: Exception) {
-                        // Codec stopped
                     }
                 }
             }
@@ -422,7 +494,7 @@ class CameraStreamEngine(
         val nv21 = yuv420888ToNv21(image)
         val out = ByteArrayOutputStream(image.width * image.height / 4)
         val yuv = YuvImage(nv21, ImageFormat.NV21, image.width, image.height, null)
-        yuv.compressToJpeg(Rect(0, 0, image.width, image.height), 82, out)
+        yuv.compressToJpeg(Rect(0, 0, image.width, image.height), 78, out)
         val jpegBytes = out.toByteArray()
         val flags = Protocol.buildVideoFlags(
             isKeyFrame = true,
@@ -542,6 +614,12 @@ class CameraStreamEngine(
         builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
         builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
 
+        // Disable multi-frame ISP buffering (EIS/OIS/Heavy NR) on Android 15 for minimal glass-to-glass lag
+        builder.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF)
+        builder.set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_OFF)
+        builder.set(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_FAST)
+        builder.set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_FAST)
+
         val fpsRange = selectFpsRange(config.fps)
         if (fpsRange != null) {
             builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fpsRange)
@@ -571,8 +649,9 @@ class CameraStreamEngine(
         val ranges = currentCharacteristics?.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
             ?: return Range(targetFps, targetFps)
         return ranges.firstOrNull { it.lower == targetFps && it.upper == targetFps }
+            ?: ranges.filter { it.upper >= targetFps && it.lower >= 24 }.minByOrNull { abs(it.upper - targetFps) + abs(it.lower - targetFps) }
             ?: ranges.filter { it.upper == targetFps }.maxByOrNull { it.lower }
-            ?: ranges.minByOrNull { kotlin.math.abs(it.upper - targetFps) }
+            ?: ranges.minByOrNull { abs(it.upper - targetFps) }
     }
 
     private fun closePipelineLocked() {

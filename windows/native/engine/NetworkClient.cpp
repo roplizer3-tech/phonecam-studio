@@ -7,6 +7,7 @@
 #include <bcrypt.h>
 
 #include "NetworkClient.h"
+#include "BluetoothClient.h"
 
 #include <algorithm>
 #include <chrono>
@@ -29,6 +30,34 @@ struct WinsockGuard {
 
 void EnsureWinsock() {
     static WinsockGuard guard;
+}
+
+enum class RecvStatus {
+    Ok,
+    IdleTimeout,
+    Closed
+};
+
+RecvStatus RecvHeaderWithIdleTimeout(SOCKET s, PacketHeader& hdr, const std::atomic<bool>& running) {
+    uint8_t* ptr = reinterpret_cast<uint8_t*>(&hdr);
+    size_t remaining = sizeof(hdr);
+    while (remaining > 0 && running.load()) {
+        int n = recv(s, reinterpret_cast<char*>(ptr), static_cast<int>(remaining), 0);
+        if (n == 0) return RecvStatus::Closed;
+        if (n < 0) {
+            int err = WSAGetLastError();
+            if (err == WSAETIMEDOUT) {
+                if (remaining == sizeof(hdr)) {
+                    return RecvStatus::IdleTimeout;
+                }
+                continue;
+            }
+            return RecvStatus::Closed;
+        }
+        ptr += n;
+        remaining -= static_cast<size_t>(n);
+    }
+    return (remaining == 0) ? RecvStatus::Ok : RecvStatus::Closed;
 }
 
 bool RecvExact(SOCKET s, void* buf, size_t len, const std::atomic<bool>& running) {
@@ -170,7 +199,9 @@ void NetworkClient::DiscoveryLoop() {
 
     BOOL reuse = TRUE;
     setsockopt(s, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&reuse), sizeof(reuse));
-    DWORD timeoutMs = 500;
+    BOOL broadcast = TRUE;
+    setsockopt(s, SOL_SOCKET, SO_BROADCAST, reinterpret_cast<const char*>(&broadcast), sizeof(broadcast));
+    DWORD timeoutMs = 400;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeoutMs), sizeof(timeoutMs));
 
     sockaddr_in addr{};
@@ -184,8 +215,26 @@ void NetworkClient::DiscoveryLoop() {
         return;
     }
 
+    sockaddr_in probeDst{};
+    probeDst.sin_family = AF_INET;
+    probeDst.sin_addr.s_addr = INADDR_BROADCAST;
+    probeDst.sin_port = htons(kUdpDiscoveryPort);
+    constexpr const char* kProbePayload = "{\"magic\":\"PCAM_PROBE\"}";
+    uint64_t lastProbeMs = 0;
+
     char buf[2048];
     while (discRunning_.load()) {
+        const uint64_t nowTick = GetTickCount64();
+        if (lastProbeMs == 0 || (nowTick - lastProbeMs) >= 2000u) {
+            lastProbeMs = nowTick;
+            sendto(s,
+                   kProbePayload,
+                   static_cast<int>(std::strlen(kProbePayload)),
+                   0,
+                   reinterpret_cast<const sockaddr*>(&probeDst),
+                   sizeof(probeDst));
+        }
+
         sockaddr_in from{};
         int fromLen = sizeof(from);
         int n = recvfrom(s, buf, sizeof(buf) - 1, 0, reinterpret_cast<sockaddr*>(&from), &fromLen);
@@ -241,16 +290,38 @@ bool NetworkClient::Connect(const std::string& ip, uint16_t port, const std::str
         status_ = ConnectionStatus{};
         status_.connecting = true;
         status_.isUsb = isUsb;
+        status_.isBluetooth = false;
         status_.remoteIp = ip;
     }
 
     connRunning_.store(true);
-    connThread_ = std::thread(&NetworkClient::ClientLoop, this, ip, port, pin, isUsb, std::move(onVideo));
+    connThread_ = std::thread(&NetworkClient::TcpConnectAndRun, this, ip, port, pin, isUsb, std::move(onVideo));
+    return true;
+}
+
+bool NetworkClient::ConnectBluetooth(const std::string& btAddr, const std::string& pin, VideoPacketCallback onVideo) {
+    EnsureWinsock();
+    Disconnect();
+
+    {
+        std::lock_guard<std::mutex> lk(statusMutex_);
+        status_ = ConnectionStatus{};
+        status_.connecting = true;
+        status_.isUsb = false;
+        status_.isBluetooth = true;
+        status_.remoteIp = btAddr;
+    }
+
+    connRunning_.store(true);
+    connThread_ = std::thread(&NetworkClient::BtConnectAndRun, this, btAddr, pin, std::move(onVideo));
     return true;
 }
 
 void NetworkClient::Disconnect() {
     connRunning_.store(false);
+    videoRunning_.store(false);
+    videoCv_.notify_all();
+
     {
         std::lock_guard<std::mutex> lk(sockMutex_);
         if (clientSocket_ != static_cast<uintptr_t>(INVALID_SOCKET)) {
@@ -261,6 +332,9 @@ void NetworkClient::Disconnect() {
     }
     if (connThread_.joinable()) {
         connThread_.join();
+    }
+    if (videoThread_.joinable()) {
+        videoThread_.join();
     }
     std::lock_guard<std::mutex> lk(statusMutex_);
     status_.connected = false;
@@ -317,7 +391,65 @@ ConnectionStatus NetworkClient::GetStatus() {
     return status_;
 }
 
-void NetworkClient::ClientLoop(std::string ip, uint16_t port, std::string pin, bool, VideoPacketCallback onVideo) {
+void NetworkClient::EnqueueVideoPacket(PacketType type, uint8_t flags, uint32_t tsMs, std::vector<uint8_t>&& payload) {
+    const bool isConfig = (flags & kFlagCodecConfig) != 0;
+    const bool isKey = (flags & kFlagKeyframe) != 0;
+
+    std::lock_guard<std::mutex> lk(videoMutex_);
+    if (type == PacketType::VideoH264 && !isConfig && awaitingKeyframe_ && !isKey) {
+        return;
+    }
+
+    size_t nonConfigCount = 0;
+    for (const auto& q : videoQueue_) {
+        if ((q.flags & kFlagCodecConfig) == 0) ++nonConfigCount;
+    }
+
+    if (!isConfig && nonConfigCount >= 4) {
+        // Erase stale non-config frames while keeping SPS/PPS intact
+        videoQueue_.erase(
+            std::remove_if(videoQueue_.begin(), videoQueue_.end(), [](const QueuedVideoPacket& q) {
+                return (q.flags & kFlagCodecConfig) == 0;
+            }),
+            videoQueue_.end());
+
+        if (type == PacketType::VideoH264 && !isKey) {
+            awaitingKeyframe_ = true;
+            requestKeyframePending_.store(true);
+            return;
+        }
+    }
+
+    if (type == PacketType::VideoH264 && isKey) {
+        awaitingKeyframe_ = false;
+    }
+
+    QueuedVideoPacket pkt;
+    pkt.type = type;
+    pkt.flags = flags;
+    pkt.timestampMs = tsMs;
+    pkt.data = std::move(payload);
+    videoQueue_.push_back(std::move(pkt));
+    videoCv_.notify_one();
+}
+
+void NetworkClient::VideoWorkerLoop(const VideoPacketCallback& onVideo) {
+    while (videoRunning_.load()) {
+        QueuedVideoPacket pkt;
+        {
+            std::unique_lock<std::mutex> lk(videoMutex_);
+            videoCv_.wait(lk, [&]() { return !videoRunning_.load() || !videoQueue_.empty(); });
+            if (!videoRunning_.load()) break;
+            pkt = std::move(videoQueue_.front());
+            videoQueue_.pop_front();
+        }
+        if (onVideo && !pkt.data.empty()) {
+            onVideo(pkt.type, pkt.flags, pkt.data.data(), pkt.data.size(), pkt.timestampMs);
+        }
+    }
+}
+
+void NetworkClient::TcpConnectAndRun(std::string ip, uint16_t port, std::string pin, bool, VideoPacketCallback onVideo) {
     SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (s == INVALID_SOCKET) {
         std::lock_guard<std::mutex> lk(statusMutex_);
@@ -325,13 +457,6 @@ void NetworkClient::ClientLoop(std::string ip, uint16_t port, std::string pin, b
         status_.lastError = "Failed creating TCP socket";
         return;
     }
-
-    BOOL nodelay = TRUE;
-    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
-    DWORD timeoutMs = 1500;
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeoutMs), sizeof(timeoutMs));
-    int rcvBuf = 512 * 1024;
-    setsockopt(s, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&rcvBuf), sizeof(rcvBuf));
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
@@ -352,10 +477,46 @@ void NetworkClient::ClientLoop(std::string ip, uint16_t port, std::string pin, b
         return;
     }
 
+    RunSocketLoop(static_cast<uintptr_t>(s), pin, false, std::move(onVideo));
+}
+
+void NetworkClient::BtConnectAndRun(std::string btAddr, std::string pin, VideoPacketCallback onVideo) {
+    uint64_t sockHandle = BluetoothHelper::ConnectRfcommSocket(btAddr);
+    if (sockHandle == static_cast<uint64_t>(INVALID_SOCKET)) {
+        std::lock_guard<std::mutex> lk(statusMutex_);
+        status_.connecting = false;
+        status_.lastError = "Cannot open Bluetooth RFCOMM channel on " + btAddr;
+        return;
+    }
+    RunSocketLoop(static_cast<uintptr_t>(sockHandle), pin, true, std::move(onVideo));
+}
+
+void NetworkClient::RunSocketLoop(uintptr_t sockHandle, const std::string& pin, bool isBluetooth, VideoPacketCallback onVideo) {
+    SOCKET s = static_cast<SOCKET>(sockHandle);
+
+    if (!isBluetooth) {
+        BOOL nodelay = TRUE;
+        setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
+    }
+    DWORD timeoutMs = 250;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeoutMs), sizeof(timeoutMs));
+    int rcvBuf = isBluetooth ? (256 * 1024) : (512 * 1024);
+    setsockopt(s, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&rcvBuf), sizeof(rcvBuf));
+
     {
         std::lock_guard<std::mutex> lk(sockMutex_);
-        clientSocket_ = static_cast<uintptr_t>(s);
+        clientSocket_ = sockHandle;
     }
+    {
+        std::lock_guard<std::mutex> lk(videoMutex_);
+        videoQueue_.clear();
+        awaitingKeyframe_ = false;
+    }
+    requestKeyframePending_.store(false);
+
+    videoRunning_.store(true);
+    videoThread_ = std::thread(&NetworkClient::VideoWorkerLoop, this, onVideo);
+
     {
         std::lock_guard<std::mutex> lk(statusMutex_);
         status_.connecting = false;
@@ -370,81 +531,89 @@ void NetworkClient::ClientLoop(std::string ip, uint16_t port, std::string pin, b
 
     while (connRunning_.load()) {
         PacketHeader hdr{};
-        if (!RecvExact(s, &hdr, sizeof(hdr), connRunning_)) break;
-        if (!ValidateHeader(hdr)) {
-            std::lock_guard<std::mutex> lk(statusMutex_);
-            status_.lastError = "Protocol header validation failed";
-            break;
-        }
-        payload.resize(hdr.payloadSize);
-        if (hdr.payloadSize > 0 && !RecvExact(s, payload.data(), hdr.payloadSize, connRunning_)) {
-            break;
+        RecvStatus st = RecvHeaderWithIdleTimeout(s, hdr, connRunning_);
+        if (st == RecvStatus::Closed) break;
+
+        if (st == RecvStatus::Ok) {
+            if (!ValidateHeader(hdr)) {
+                std::lock_guard<std::mutex> lk(statusMutex_);
+                status_.lastError = "Protocol header validation failed";
+                break;
+            }
+            payload.resize(hdr.payloadSize);
+            if (hdr.payloadSize > 0 && !RecvExact(s, payload.data(), hdr.payloadSize, connRunning_)) {
+                break;
+            }
+
+            const auto pType = static_cast<PacketType>(hdr.type);
+            switch (pType) {
+                case PacketType::Hello: {
+                    std::string json(reinterpret_cast<const char*>(payload.data()), payload.size());
+                    bool pinReq = ExtractJsonBool(json, "pinRequired", false);
+                    std::string nonce = ExtractJsonString(json, "nonce");
+                    std::string devName = ExtractJsonString(json, "deviceName", "Android");
+                    std::string cams = ExtractJsonArray(json, "cameras");
+                    {
+                        std::lock_guard<std::mutex> lk(statusMutex_);
+                        status_.deviceName = devName;
+                        status_.camerasJson = cams;
+                        status_.authenticated = !pinReq;
+                    }
+                    if (pinReq) {
+                        std::string hash = Sha256Hex(nonce + ":" + pin);
+                        std::string authJson = "{\"pinHash\":\"" + hash + "\"}";
+                        SendPacket(static_cast<uint64_t>(s), PacketType::Auth, 0, authJson.data(), static_cast<uint32_t>(authJson.size()), 0);
+                    }
+                    break;
+                }
+                case PacketType::Auth: {
+                    std::string json(reinterpret_cast<const char*>(payload.data()), payload.size());
+                    bool ok = ExtractJsonBool(json, "ok", false);
+                    std::string reason = ExtractJsonString(json, "reason", "Authentication failed");
+                    std::lock_guard<std::mutex> lk(statusMutex_);
+                    status_.authenticated = ok;
+                    if (!ok) status_.lastError = reason;
+                    break;
+                }
+                case PacketType::VideoH264:
+                case PacketType::VideoMjpeg: {
+                    if ((hdr.flags & kFlagCodecConfig) == 0) {
+                        ++frameCounter;
+                    }
+                    std::vector<uint8_t> pktBuf = std::move(payload);
+                    EnqueueVideoPacket(pType, hdr.flags, hdr.timestampMs, std::move(pktBuf));
+                    break;
+                }
+                case PacketType::Telemetry: {
+                    std::string json(reinterpret_cast<const char*>(payload.data()), payload.size());
+                    std::lock_guard<std::mutex> lk(statusMutex_);
+                    status_.telemetryJson = json;
+                    break;
+                }
+                case PacketType::Pong: {
+                    if (payload.size() == sizeof(uint64_t)) {
+                        uint64_t sentAt = 0;
+                        std::memcpy(&sentAt, payload.data(), sizeof(uint64_t));
+                        uint64_t now = GetTickCount64();
+                        if (now >= sentAt) {
+                            std::lock_guard<std::mutex> lk(statusMutex_);
+                            status_.latencyMs = static_cast<double>(now - sentAt);
+                        }
+                    }
+                    break;
+                }
+                default:
+                    break;
+            }
         }
 
-        const auto pType = static_cast<PacketType>(hdr.type);
-        switch (pType) {
-            case PacketType::Hello: {
-                std::string json(reinterpret_cast<const char*>(payload.data()), payload.size());
-                bool pinReq = ExtractJsonBool(json, "pinRequired", false);
-                std::string nonce = ExtractJsonString(json, "nonce");
-                std::string devName = ExtractJsonString(json, "deviceName", "Android");
-                std::string cams = ExtractJsonArray(json, "cameras");
-                {
-                    std::lock_guard<std::mutex> lk(statusMutex_);
-                    status_.deviceName = devName;
-                    status_.camerasJson = cams;
-                    status_.authenticated = !pinReq;
-                }
-                if (pinReq) {
-                    std::string hash = Sha256Hex(nonce + ":" + pin);
-                    std::string authJson = "{\"pinHash\":\"" + hash + "\"}";
-                    SendPacket(static_cast<uint64_t>(s), PacketType::Auth, 0, authJson.data(), static_cast<uint32_t>(authJson.size()), 0);
-                }
-                break;
-            }
-            case PacketType::Auth: {
-                std::string json(reinterpret_cast<const char*>(payload.data()), payload.size());
-                bool ok = ExtractJsonBool(json, "ok", false);
-                std::string reason = ExtractJsonString(json, "reason", "Authentication failed");
-                std::lock_guard<std::mutex> lk(statusMutex_);
-                status_.authenticated = ok;
-                if (!ok) status_.lastError = reason;
-                break;
-            }
-            case PacketType::VideoH264:
-            case PacketType::VideoMjpeg: {
-                if ((hdr.flags & kFlagCodecConfig) == 0) {
-                    ++frameCounter;
-                }
-                if (onVideo) {
-                    onVideo(pType, hdr.flags, payload.data(), payload.size(), hdr.timestampMs);
-                }
-                break;
-            }
-            case PacketType::Telemetry: {
-                std::string json(reinterpret_cast<const char*>(payload.data()), payload.size());
-                std::lock_guard<std::mutex> lk(statusMutex_);
-                status_.telemetryJson = json;
-                break;
-            }
-            case PacketType::Pong: {
-                if (payload.size() == sizeof(uint64_t)) {
-                    uint64_t sentAt = 0;
-                    std::memcpy(&sentAt, payload.data(), sizeof(uint64_t));
-                    uint64_t now = GetTickCount64();
-                    if (now >= sentAt) {
-                        std::lock_guard<std::mutex> lk(statusMutex_);
-                        status_.latencyMs = static_cast<double>(now - sentAt);
-                    }
-                }
-                break;
-            }
-            default:
-                break;
+        if (requestKeyframePending_.exchange(false)) {
+            constexpr const char* kKfCmd = "{\"cmd\":\"request_keyframe\"}";
+            SendPacket(static_cast<uint64_t>(s), PacketType::Control, 0, kKfCmd, static_cast<uint32_t>(std::strlen(kKfCmd)), static_cast<uint32_t>(GetTickCount64()));
         }
 
         const uint64_t now = GetTickCount64();
-        if (now - lastPingMs >= 1000u) {
+        if (now - lastPingMs >= 500u) {
             lastPingMs = now;
             SendPacket(static_cast<uint64_t>(s), PacketType::Ping, 0, &now, sizeof(now), static_cast<uint32_t>(now));
         }
@@ -458,9 +627,15 @@ void NetworkClient::ClientLoop(std::string ip, uint16_t port, std::string pin, b
         }
     }
 
+    videoRunning_.store(false);
+    videoCv_.notify_all();
+    if (videoThread_.joinable()) {
+        videoThread_.join();
+    }
+
     {
         std::lock_guard<std::mutex> lk(sockMutex_);
-        if (clientSocket_ == static_cast<uintptr_t>(s)) {
+        if (clientSocket_ == sockHandle) {
             closesocket(s);
             clientSocket_ = static_cast<uintptr_t>(INVALID_SOCKET);
         }

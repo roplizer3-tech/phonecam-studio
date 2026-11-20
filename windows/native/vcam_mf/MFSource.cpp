@@ -11,10 +11,8 @@ namespace phonecam::mf {
 
 namespace {
 
-// {FB6C4281-0353-11D1-905F-0000C0CC16BA} == PINNAME_VIDEO_CAPTURE
-inline constexpr GUID kPinNameVideoCapture = {
-    0xFB6C4281u, 0x0353u, 0x11D1u, { 0x90u, 0x5Fu, 0x00u, 0x00u, 0xC0u, 0xCCu, 0x16u, 0xBAu }
-};
+using FnMFCreateSensorProfileCollection = HRESULT(STDAPICALLTYPE*)(IMFSensorProfileCollection**);
+using FnMFCreateSensorProfile = HRESULT(STDAPICALLTYPE*)(REFGUID, UINT32, LPCWSTR, IMFSensorProfile**);
 
 HRESULT CreateVideoMediaType(
     const GUID& subtype,
@@ -38,14 +36,87 @@ HRESULT CreateVideoMediaType(
 
     UINT32 stride = width;
     UINT32 sampleSize = width * height * 3u / 2u;
+    UINT32 avgBitrate = static_cast<UINT32>((static_cast<uint64_t>(width) * height * 12ULL * fpsNum) / std::max(1u, fpsDen));
     if (subtype == MFVideoFormat_RGB32) {
         stride = width * 4u;
         sampleSize = stride * height;
+        avgBitrate = static_cast<UINT32>((static_cast<uint64_t>(width) * height * 32ULL * fpsNum) / std::max(1u, fpsDen));
     }
     mt->SetUINT32(MF_MT_DEFAULT_STRIDE, stride);
     mt->SetUINT32(MF_MT_SAMPLE_SIZE, sampleSize);
+    mt->SetUINT32(MF_MT_AVG_BITRATE, avgBitrate);
 
     *ppType = mt.Detach();
+    return S_OK;
+}
+
+HRESULT CopyFrameIntoBuffer(
+    IMFMediaBuffer* buf,
+    const uint8_t* nv12Src,
+    uint32_t width,
+    uint32_t height,
+    bool isRgb32,
+    std::vector<uint8_t>& rgbScratch) {
+    if (!buf || !nv12Src) return E_POINTER;
+
+    const DWORD packedSize = isRgb32 ? (width * height * 4u) : (width * height * 3u / 2u);
+    if (isRgb32) {
+        rgbScratch.resize(packedSize);
+        NV12ToBGRA32(nv12Src, width, height, rgbScratch.data(), width * 4u);
+    }
+
+    ComPtr<IMF2DBuffer2> buf2d2;
+    BYTE* scan0 = nullptr;
+    LONG pitch = 0;
+    BYTE* bufStart = nullptr;
+    DWORD bufLen = 0;
+
+    if (SUCCEEDED(buf->QueryInterface(IID_PPV_ARGS(&buf2d2))) &&
+        SUCCEEDED(buf2d2->Lock2DSize(MF2DBuffer_LockFlags_Write, &scan0, &pitch, &bufStart, &bufLen))) {
+        if (isRgb32) {
+            MFCopyImage(scan0, pitch, rgbScratch.data(), static_cast<LONG>(width * 4u), width * 4u, height);
+        } else {
+            MFCopyImage(scan0, pitch, nv12Src, static_cast<LONG>(width), width, height);
+            BYTE* dstUv = scan0 + static_cast<size_t>(std::abs(pitch)) * height;
+            const uint8_t* srcUv = nv12Src + static_cast<size_t>(width) * height;
+            MFCopyImage(dstUv, pitch, srcUv, static_cast<LONG>(width), width, height / 2);
+        }
+        buf2d2->Unlock2D();
+        buf->SetCurrentLength(packedSize);
+        return S_OK;
+    }
+
+    ComPtr<IMF2DBuffer> buf2d;
+    if (SUCCEEDED(buf->QueryInterface(IID_PPV_ARGS(&buf2d))) &&
+        SUCCEEDED(buf2d->Lock2D(&scan0, &pitch))) {
+        if (isRgb32) {
+            MFCopyImage(scan0, pitch, rgbScratch.data(), static_cast<LONG>(width * 4u), width * 4u, height);
+        } else {
+            MFCopyImage(scan0, pitch, nv12Src, static_cast<LONG>(width), width, height);
+            BYTE* dstUv = scan0 + static_cast<size_t>(std::abs(pitch)) * height;
+            const uint8_t* srcUv = nv12Src + static_cast<size_t>(width) * height;
+            MFCopyImage(dstUv, pitch, srcUv, static_cast<LONG>(width), width, height / 2);
+        }
+        buf2d->Unlock2D();
+        buf->SetCurrentLength(packedSize);
+        return S_OK;
+    }
+
+    BYTE* dst = nullptr;
+    DWORD maxLen = 0;
+    HRESULT hr = buf->Lock(&dst, &maxLen, nullptr);
+    if (FAILED(hr)) return hr;
+    if (maxLen < packedSize) {
+        buf->Unlock();
+        return MF_E_BUFFERTOOSMALL;
+    }
+    if (isRgb32) {
+        std::memcpy(dst, rgbScratch.data(), packedSize);
+    } else {
+        std::memcpy(dst, nv12Src, packedSize);
+    }
+    buf->Unlock();
+    buf->SetCurrentLength(packedSize);
     return S_OK;
 }
 
@@ -55,25 +126,68 @@ HRESULT CreateVideoMediaType(
 // PhoneCamMediaStream
 // ============================================================================
 
-PhoneCamMediaStream::PhoneCamMediaStream(PhoneCamMediaSource* parent, IMFStreamDescriptor* sd)
-    : parent_(parent), streamDesc_(sd) {
+PhoneCamMediaStream::PhoneCamMediaStream(PhoneCamMediaSource* parent, int index)
+    : parent_(parent), index_(index) {
     IncrementModuleRef();
+    MFCreateAttributes(&attrs_, 8);
     MFCreateEventQueue(&eventQueue_);
-    MFCreateAttributes(&streamAttrs_, 6);
-    if (streamAttrs_) {
-        streamAttrs_->SetUINT32(MF_DEVICESTREAM_STREAM_ID, 0);
-        streamAttrs_->SetGUID(MF_DEVICESTREAM_STREAM_CATEGORY, kPinNameVideoCapture);
-        streamAttrs_->SetUINT32(MF_DEVICESTREAM_FRAMESERVER_SHARED, 1);
-        streamAttrs_->SetUINT32(MF_DEVICESTREAM_ATTRIBUTE_FRAMESOURCE_TYPES, MFFrameSourceTypes_Color);
-    }
     QueryPerformanceFrequency(&qpcFreq_);
     QueryPerformanceCounter(&nextFrameQpc_);
-    shmReader_.Open();
 }
 
 PhoneCamMediaStream::~PhoneCamMediaStream() {
     shmReader_.Close();
     DecrementModuleRef();
+}
+
+HRESULT PhoneCamMediaStream::Initialize() {
+    if (!attrs_ || !eventQueue_) return E_OUTOFMEMORY;
+
+    attrs_->SetGUID(MF_DEVICESTREAM_STREAM_CATEGORY, PINNAME_VIDEO_CAPTURE);
+    attrs_->SetUINT32(MF_DEVICESTREAM_STREAM_ID, static_cast<UINT32>(index_));
+    attrs_->SetUINT32(MF_DEVICESTREAM_FRAMESERVER_SHARED, 1);
+    attrs_->SetUINT32(MF_DEVICESTREAM_ATTRIBUTE_FRAMESOURCE_TYPES, MFFrameSourceTypes_Color);
+
+    struct MediaSpec {
+        GUID subtype;
+        uint32_t w, h, fps;
+    };
+    static const std::array<MediaSpec, 5> kSpecs = {{
+        { MFVideoFormat_NV12, 1280, 720, 60 },
+        { MFVideoFormat_NV12, 1280, 720, 30 },
+        { MFVideoFormat_NV12, 1920, 1080, 30 },
+        { MFVideoFormat_RGB32, 1280, 720, 30 },
+        { MFVideoFormat_RGB32, 1920, 1080, 30 }
+    }};
+
+    std::array<IMFMediaType*, kSpecs.size()> types{};
+    HRESULT hr = S_OK;
+    for (size_t i = 0; i < kSpecs.size(); ++i) {
+        hr = CreateVideoMediaType(kSpecs[i].subtype, kSpecs[i].w, kSpecs[i].h, kSpecs[i].fps, 1, &types[i]);
+        if (FAILED(hr)) {
+            for (size_t j = 0; j < i; ++j) types[j]->Release();
+            return hr;
+        }
+    }
+
+    hr = MFCreateStreamDescriptor(static_cast<DWORD>(index_), static_cast<DWORD>(types.size()), types.data(), &streamDesc_);
+    if (SUCCEEDED(hr) && streamDesc_) {
+        defaultType_ = types[0];
+        activeType_ = types[0];
+        ComPtr<IMFMediaTypeHandler> handler;
+        if (SUCCEEDED(streamDesc_->GetMediaTypeHandler(&handler))) {
+            handler->SetCurrentMediaType(types[0]);
+        }
+        streamDesc_->SetUINT32(MF_DEVICESTREAM_STREAM_ID, static_cast<UINT32>(index_));
+        streamDesc_->SetGUID(MF_DEVICESTREAM_STREAM_CATEGORY, PINNAME_VIDEO_CAPTURE);
+        streamDesc_->SetUINT32(MF_DEVICESTREAM_FRAMESERVER_SHARED, 1);
+        streamDesc_->SetUINT32(MF_DEVICESTREAM_ATTRIBUTE_FRAMESOURCE_TYPES, MFFrameSourceTypes_Color);
+    }
+    for (IMFMediaType* t : types) t->Release();
+    if (FAILED(hr)) return hr;
+
+    shmReader_.Open();
+    return S_OK;
 }
 
 IFACEMETHODIMP PhoneCamMediaStream::QueryInterface(REFIID riid, void** ppv) {
@@ -82,6 +196,8 @@ IFACEMETHODIMP PhoneCamMediaStream::QueryInterface(REFIID riid, void** ppv) {
     if (riid == IID_IUnknown || riid == IID_IMFMediaEventGenerator ||
         riid == IID_IMFMediaStream || riid == IID_IMFMediaStream2) {
         *ppv = static_cast<IMFMediaStream2*>(this);
+    } else if (riid == IID_IMFAttributes) {
+        *ppv = static_cast<IMFAttributes*>(this);
     } else if (riid == __uuidof(IKsControl)) {
         *ppv = static_cast<IKsControl*>(this);
     } else {
@@ -100,6 +216,38 @@ IFACEMETHODIMP_(ULONG) PhoneCamMediaStream::Release() {
     if (c == 0) delete this;
     return c;
 }
+
+// IMFAttributes delegation
+IFACEMETHODIMP PhoneCamMediaStream::GetItem(REFGUID guidKey, PROPVARIANT* pValue) { return attrs_->GetItem(guidKey, pValue); }
+IFACEMETHODIMP PhoneCamMediaStream::GetItemType(REFGUID guidKey, MF_ATTRIBUTE_TYPE* pType) { return attrs_->GetItemType(guidKey, pType); }
+IFACEMETHODIMP PhoneCamMediaStream::CompareItem(REFGUID guidKey, REFPROPVARIANT Value, BOOL* pbResult) { return attrs_->CompareItem(guidKey, Value, pbResult); }
+IFACEMETHODIMP PhoneCamMediaStream::Compare(IMFAttributes* pTheirs, MF_ATTRIBUTES_MATCH_TYPE MatchType, BOOL* pbResult) { return attrs_->Compare(pTheirs, MatchType, pbResult); }
+IFACEMETHODIMP PhoneCamMediaStream::GetUINT32(REFGUID guidKey, UINT32* punValue) { return attrs_->GetUINT32(guidKey, punValue); }
+IFACEMETHODIMP PhoneCamMediaStream::GetUINT64(REFGUID guidKey, UINT64* punValue) { return attrs_->GetUINT64(guidKey, punValue); }
+IFACEMETHODIMP PhoneCamMediaStream::GetDouble(REFGUID guidKey, double* pfValue) { return attrs_->GetDouble(guidKey, pfValue); }
+IFACEMETHODIMP PhoneCamMediaStream::GetGUID(REFGUID guidKey, GUID* pguidValue) { return attrs_->GetGUID(guidKey, pguidValue); }
+IFACEMETHODIMP PhoneCamMediaStream::GetStringLength(REFGUID guidKey, UINT32* pcchLength) { return attrs_->GetStringLength(guidKey, pcchLength); }
+IFACEMETHODIMP PhoneCamMediaStream::GetString(REFGUID guidKey, LPWSTR pwszValue, UINT32 cchBufSize, UINT32* pcchLength) { return attrs_->GetString(guidKey, pwszValue, cchBufSize, pcchLength); }
+IFACEMETHODIMP PhoneCamMediaStream::GetAllocatedString(REFGUID guidKey, LPWSTR* ppwszValue, UINT32* pcchLength) { return attrs_->GetAllocatedString(guidKey, ppwszValue, pcchLength); }
+IFACEMETHODIMP PhoneCamMediaStream::GetBlobSize(REFGUID guidKey, UINT32* pcbBlobSize) { return attrs_->GetBlobSize(guidKey, pcbBlobSize); }
+IFACEMETHODIMP PhoneCamMediaStream::GetBlob(REFGUID guidKey, UINT8* pBuf, UINT32 cbBufSize, UINT32* pcbBlobSize) { return attrs_->GetBlob(guidKey, pBuf, cbBufSize, pcbBlobSize); }
+IFACEMETHODIMP PhoneCamMediaStream::GetAllocatedBlob(REFGUID guidKey, UINT8** ppBuf, UINT32* pcbSize) { return attrs_->GetAllocatedBlob(guidKey, ppBuf, pcbSize); }
+IFACEMETHODIMP PhoneCamMediaStream::GetUnknown(REFGUID guidKey, REFIID riid, LPVOID* ppv) { return attrs_->GetUnknown(guidKey, riid, ppv); }
+IFACEMETHODIMP PhoneCamMediaStream::SetItem(REFGUID guidKey, REFPROPVARIANT Value) { return attrs_->SetItem(guidKey, Value); }
+IFACEMETHODIMP PhoneCamMediaStream::DeleteItem(REFGUID guidKey) { return attrs_->DeleteItem(guidKey); }
+IFACEMETHODIMP PhoneCamMediaStream::DeleteAllItems() { return attrs_->DeleteAllItems(); }
+IFACEMETHODIMP PhoneCamMediaStream::SetUINT32(REFGUID guidKey, UINT32 unValue) { return attrs_->SetUINT32(guidKey, unValue); }
+IFACEMETHODIMP PhoneCamMediaStream::SetUINT64(REFGUID guidKey, UINT64 unValue) { return attrs_->SetUINT64(guidKey, unValue); }
+IFACEMETHODIMP PhoneCamMediaStream::SetDouble(REFGUID guidKey, double fValue) { return attrs_->SetDouble(guidKey, fValue); }
+IFACEMETHODIMP PhoneCamMediaStream::SetGUID(REFGUID guidKey, REFGUID guidValue) { return attrs_->SetGUID(guidKey, guidValue); }
+IFACEMETHODIMP PhoneCamMediaStream::SetString(REFGUID guidKey, LPCWSTR wszValue) { return attrs_->SetString(guidKey, wszValue); }
+IFACEMETHODIMP PhoneCamMediaStream::SetBlob(REFGUID guidKey, const UINT8* pBuf, UINT32 cbBufSize) { return attrs_->SetBlob(guidKey, pBuf, cbBufSize); }
+IFACEMETHODIMP PhoneCamMediaStream::SetUnknown(REFGUID guidKey, IUnknown* pUnknown) { return attrs_->SetUnknown(guidKey, pUnknown); }
+IFACEMETHODIMP PhoneCamMediaStream::LockStore() { return attrs_->LockStore(); }
+IFACEMETHODIMP PhoneCamMediaStream::UnlockStore() { return attrs_->UnlockStore(); }
+IFACEMETHODIMP PhoneCamMediaStream::GetCount(UINT32* pcItems) { return attrs_->GetCount(pcItems); }
+IFACEMETHODIMP PhoneCamMediaStream::GetItemByIndex(UINT32 unIndex, GUID* pguidKey, PROPVARIANT* pValue) { return attrs_->GetItemByIndex(unIndex, pguidKey, pValue); }
+IFACEMETHODIMP PhoneCamMediaStream::CopyAllItems(IMFAttributes* pDest) { return attrs_->CopyAllItems(pDest); }
 
 IFACEMETHODIMP PhoneCamMediaStream::GetEvent(DWORD dwFlags, IMFMediaEvent** ppEvent) {
     std::lock_guard<std::mutex> lk(mutex_);
@@ -142,10 +290,10 @@ IFACEMETHODIMP PhoneCamMediaStream::GetStreamDescriptor(IMFStreamDescriptor** pp
 }
 
 IFACEMETHODIMP PhoneCamMediaStream::SetStreamState(MF_STREAM_STATE value) {
-    std::lock_guard<std::mutex> lk(mutex_);
-    if (shutdown_) return MF_E_SHUTDOWN;
-    state_ = value;
-    return S_OK;
+    if (value == MF_STREAM_STATE_RUNNING) return Start(nullptr, nullptr);
+    if (value == MF_STREAM_STATE_STOPPED) return Stop();
+    if (value == MF_STREAM_STATE_PAUSED) return Pause();
+    return MF_E_INVALID_STATE_TRANSITION;
 }
 
 IFACEMETHODIMP PhoneCamMediaStream::GetStreamState(MF_STREAM_STATE* value) {
@@ -171,23 +319,50 @@ IFACEMETHODIMP PhoneCamMediaStream::KsEvent(PKSEVENT, ULONG, LPVOID, ULONG, ULON
     return HRESULT_FROM_WIN32(ERROR_SET_NOT_FOUND);
 }
 
+HRESULT PhoneCamMediaStream::SetAllocator(IUnknown* pAllocator) {
+    if (!pAllocator) return E_POINTER;
+    std::lock_guard<std::mutex> lk(mutex_);
+    allocator_.Reset();
+    return pAllocator->QueryInterface(IID_PPV_ARGS(&allocator_));
+}
+
+HRESULT PhoneCamMediaStream::SetD3DManager(IUnknown* pManager) {
+    if (!pManager) return E_POINTER;
+    std::lock_guard<std::mutex> lk(mutex_);
+    if (allocator_) {
+        allocator_->SetDirectXManager(pManager);
+    }
+    return S_OK;
+}
+
 HRESULT PhoneCamMediaStream::Start(IMFMediaType* mediaType, const PROPVARIANT* varStartPosition) {
     std::lock_guard<std::mutex> lk(mutex_);
     if (shutdown_) return MF_E_SHUTDOWN;
 
-    if (mediaType) {
+    IMFMediaType* chosenType = mediaType ? mediaType : (activeType_ ? activeType_.Get() : defaultType_.Get());
+    if (chosenType) {
+        activeType_ = chosenType;
         GUID sub{};
-        if (SUCCEEDED(mediaType->GetGUID(MF_MT_SUBTYPE, &sub))) {
+        if (SUCCEEDED(chosenType->GetGUID(MF_MT_SUBTYPE, &sub))) {
             activeSubtype_ = sub;
         }
-        UINT32 w = 1280, h = 720, fn = 30, fd = 1;
-        if (SUCCEEDED(MFGetAttributeSize(mediaType, MF_MT_FRAME_SIZE, &w, &h)) && w > 0 && h > 0) {
+        UINT32 w = 1280, h = 720, fn = 60, fd = 1;
+        if (SUCCEEDED(MFGetAttributeSize(chosenType, MF_MT_FRAME_SIZE, &w, &h)) && w > 0 && h > 0) {
             outW_ = w;
             outH_ = h;
         }
-        if (SUCCEEDED(MFGetAttributeRatio(mediaType, MF_MT_FRAME_RATE, &fn, &fd)) && fn > 0 && fd > 0) {
+        if (SUCCEEDED(MFGetAttributeRatio(chosenType, MF_MT_FRAME_RATE, &fn, &fd)) && fn > 0 && fd > 0) {
             fpsNum_ = fn;
             fpsDen_ = fd;
+        }
+        if (allocator_) {
+            if (allocatorInit_) {
+                allocator_->UninitializeSampleAllocator();
+                allocatorInit_ = false;
+            }
+            if (SUCCEEDED(allocator_->InitializeSampleAllocator(10, chosenType))) {
+                allocatorInit_ = true;
+            }
         }
     }
 
@@ -202,6 +377,10 @@ HRESULT PhoneCamMediaStream::Start(IMFMediaType* mediaType, const PROPVARIANT* v
 HRESULT PhoneCamMediaStream::Stop() {
     std::lock_guard<std::mutex> lk(mutex_);
     if (shutdown_) return MF_E_SHUTDOWN;
+    if (allocator_ && allocatorInit_) {
+        allocator_->UninitializeSampleAllocator();
+        allocatorInit_ = false;
+    }
     state_ = MF_STREAM_STATE_STOPPED;
     if (eventQueue_) {
         eventQueue_->QueueEventParamVar(MEStreamStopped, GUID_NULL, S_OK, nullptr);
@@ -212,6 +391,7 @@ HRESULT PhoneCamMediaStream::Stop() {
 HRESULT PhoneCamMediaStream::Pause() {
     std::lock_guard<std::mutex> lk(mutex_);
     if (shutdown_) return MF_E_SHUTDOWN;
+    if (state_ != MF_STREAM_STATE_RUNNING) return MF_E_INVALID_STATE_TRANSITION;
     state_ = MF_STREAM_STATE_PAUSED;
     if (eventQueue_) {
         eventQueue_->QueueEventParamVar(MEStreamPaused, GUID_NULL, S_OK, nullptr);
@@ -223,23 +403,27 @@ HRESULT PhoneCamMediaStream::Shutdown() {
     std::lock_guard<std::mutex> lk(mutex_);
     shutdown_ = true;
     parent_ = nullptr;
+    if (allocator_ && allocatorInit_) {
+        allocator_->UninitializeSampleAllocator();
+        allocatorInit_ = false;
+    }
+    allocator_.Reset();
     if (eventQueue_) {
         eventQueue_->Shutdown();
         eventQueue_.Reset();
     }
     streamDesc_.Reset();
-    streamAttrs_.Reset();
+    defaultType_.Reset();
+    activeType_.Reset();
+    attrs_.Reset();
     shmReader_.Close();
     return S_OK;
 }
 
 IFACEMETHODIMP PhoneCamMediaStream::RequestSample(IUnknown* pToken) {
-    uint32_t outW = 1280, outH = 720, fpsNum = 30, fpsDen = 1;
-    GUID subtype = MFVideoFormat_NV12;
+    uint32_t outW = 1280, outH = 720, fpsNum = 60, fpsDen = 1;
     LARGE_INTEGER targetQpc{};
     LARGE_INTEGER freq{};
-    LONGLONG sampleTime = 0;
-    LONGLONG sampleDur = 333333LL;
 
     {
         std::lock_guard<std::mutex> lk(mutex_);
@@ -250,11 +434,7 @@ IFACEMETHODIMP PhoneCamMediaStream::RequestSample(IUnknown* pToken) {
         outH = outH_;
         fpsNum = fpsNum_;
         fpsDen = fpsDen_;
-        subtype = activeSubtype_;
         freq = qpcFreq_;
-        sampleDur = static_cast<LONGLONG>((10000000ULL * fpsDen) / std::max(1u, fpsNum));
-        sampleTime = sampleTime100ns_;
-        sampleTime100ns_ += sampleDur;
 
         LARGE_INTEGER now{};
         QueryPerformanceCounter(&now);
@@ -266,12 +446,11 @@ IFACEMETHODIMP PhoneCamMediaStream::RequestSample(IUnknown* pToken) {
         nextFrameQpc_.QuadPart += stepTicks;
     }
 
-    // Pace sample emission cleanly without holding mutex
     LARGE_INTEGER now{};
     QueryPerformanceCounter(&now);
     if (targetQpc.QuadPart > now.QuadPart && freq.QuadPart > 0) {
         const LONGLONG waitMs = ((targetQpc.QuadPart - now.QuadPart) * 1000LL) / freq.QuadPart;
-        if (waitMs > 0 && waitMs <= 50) {
+        if (waitMs > 0 && waitMs <= 35) {
             Sleep(static_cast<DWORD>(waitMs));
         }
     }
@@ -297,50 +476,45 @@ IFACEMETHODIMP PhoneCamMediaStream::RequestSample(IUnknown* pToken) {
         nv12Ready = scaledNv12_.data();
     }
 
-    const bool isRgb32 = (subtype == MFVideoFormat_RGB32);
-    const DWORD bufSize = isRgb32
-        ? (outW * outH * 4u)
-        : (outW * outH * 3u / 2u);
-
-    ComPtr<IMFMediaBuffer> buf;
-    HRESULT hr = MFCreateMemoryBuffer(bufSize, &buf);
-    if (FAILED(hr)) return hr;
-
-    BYTE* dst = nullptr;
-    if (FAILED(hr = buf->Lock(&dst, nullptr, nullptr))) return hr;
-    if (isRgb32) {
-        NV12ToBGRA32(nv12Ready, outW, outH, dst, outW * 4u);
-    } else {
-        std::memcpy(dst, nv12Ready, bufSize);
-    }
-    buf->Unlock();
-    buf->SetCurrentLength(bufSize);
+    const bool isRgb32 = (activeSubtype_ == MFVideoFormat_RGB32);
+    const DWORD bufSize = isRgb32 ? (outW * outH * 4u) : (outW * outH * 3u / 2u);
 
     ComPtr<IMFSample> sample;
-    if (FAILED(hr = MFCreateSample(&sample))) return hr;
-    sample->AddBuffer(buf.Get());
-    sample->SetSampleTime(sampleTime);
+    if (allocator_ && allocatorInit_) {
+        HRESULT hr = allocator_->AllocateSample(&sample);
+        if (FAILED(hr) || !sample) return FAILED(hr) ? hr : E_FAIL;
+        ComPtr<IMFMediaBuffer> buf;
+        if (FAILED(hr = sample->GetBufferByIndex(0, &buf))) return hr;
+        if (FAILED(hr = CopyFrameIntoBuffer(buf.Get(), nv12Ready, outW, outH, isRgb32, rgbScratch_))) return hr;
+    } else {
+        ComPtr<IMFMediaBuffer> buf;
+        HRESULT hr = MFCreateMemoryBuffer(bufSize, &buf);
+        if (FAILED(hr)) return hr;
+        if (FAILED(hr = CopyFrameIntoBuffer(buf.Get(), nv12Ready, outW, outH, isRgb32, rgbScratch_))) return hr;
+        if (FAILED(hr = MFCreateSample(&sample))) return hr;
+        sample->AddBuffer(buf.Get());
+    }
+
+    const LONGLONG sampleDur = static_cast<LONGLONG>((10000000ULL * fpsDen) / std::max(1u, fpsNum));
+    sample->SetSampleTime(MFGetSystemTime());
     sample->SetSampleDuration(sampleDur);
     sample->SetUINT32(MFSampleExtension_CleanPoint, TRUE);
     if (pToken) {
         sample->SetUnknown(MFSampleExtension_Token, pToken);
     }
 
-    PROPVARIANT var{};
-    var.vt = VT_UNKNOWN;
-    var.punkVal = sample.Get();
-    return eventQueue_->QueueEventParamVar(MEMediaSample, GUID_NULL, S_OK, &var);
+    return eventQueue_->QueueEventParamUnk(MEMediaSample, GUID_NULL, S_OK, sample.Get());
 }
 
 // ============================================================================
 // PhoneCamMediaSource
 // ============================================================================
 
-HRESULT PhoneCamMediaSource::CreateInstance(PhoneCamMediaSource** ppSource) {
+HRESULT PhoneCamMediaSource::CreateInstance(IMFAttributes* activatorAttrs, PhoneCamMediaSource** ppSource) {
     if (!ppSource) return E_POINTER;
     *ppSource = nullptr;
     auto* src = new PhoneCamMediaSource();
-    HRESULT hr = src->Initialize();
+    HRESULT hr = src->Initialize(activatorAttrs);
     if (FAILED(hr)) {
         src->Release();
         return hr;
@@ -354,57 +528,58 @@ PhoneCamMediaSource::~PhoneCamMediaSource() {
     DecrementModuleRef();
 }
 
-HRESULT PhoneCamMediaSource::Initialize() {
+HRESULT PhoneCamMediaSource::Initialize(IMFAttributes* activatorAttrs) {
     IncrementModuleRef();
-    HRESULT hr = MFCreateEventQueue(&eventQueue_);
+
+    HRESULT hr = MFCreateAttributes(&attrs_, 12);
     if (FAILED(hr)) return hr;
-
-    hr = MFCreateAttributes(&sourceAttrs_, 4);
-    if (FAILED(hr)) return hr;
-    sourceAttrs_->SetGUID(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID);
-    sourceAttrs_->SetString(MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME, L"PhoneCam Studio");
-
-    struct MediaSpec {
-        GUID subtype;
-        uint32_t w, h, fps;
-    };
-    static const std::array<MediaSpec, 5> kSpecs = {{
-        { MFVideoFormat_NV12, 1280, 720, 30 },
-        { MFVideoFormat_NV12, 1920, 1080, 30 },
-        { MFVideoFormat_NV12, 1280, 720, 60 },
-        { MFVideoFormat_RGB32, 1280, 720, 30 },
-        { MFVideoFormat_RGB32, 1920, 1080, 30 }
-    }};
-
-    std::array<IMFMediaType*, kSpecs.size()> types{};
-    for (size_t i = 0; i < kSpecs.size(); ++i) {
-        hr = CreateVideoMediaType(kSpecs[i].subtype, kSpecs[i].w, kSpecs[i].h, kSpecs[i].fps, 1, &types[i]);
-        if (FAILED(hr)) {
-            for (size_t j = 0; j < i; ++j) types[j]->Release();
-            return hr;
-        }
+    if (activatorAttrs) {
+        activatorAttrs->CopyAllItems(attrs_.Get());
     }
+    attrs_->SetGUID(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID);
+    attrs_->SetString(MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME, L"PhoneCam Studio");
+
+    // Populate Sensor Profile Collection dynamically via mfsensorgroup.dll (Windows 10 1803+ / Windows 11)
+    if (HMODULE mfSensor = LoadLibraryW(L"mfsensorgroup.dll")) {
+        auto fnCreateCol = reinterpret_cast<FnMFCreateSensorProfileCollection>(
+            GetProcAddress(mfSensor, "MFCreateSensorProfileCollection"));
+        auto fnCreateProf = reinterpret_cast<FnMFCreateSensorProfile>(
+            GetProcAddress(mfSensor, "MFCreateSensorProfile"));
+        if (fnCreateCol && fnCreateProf) {
+            ComPtr<IMFSensorProfileCollection> col;
+            if (SUCCEEDED(fnCreateCol(&col)) && col) {
+                ComPtr<IMFSensorProfile> pLegacy;
+                if (SUCCEEDED(fnCreateProf(KSCAMERAPROFILE_Legacy, 0, nullptr, &pLegacy)) && pLegacy) {
+                    pLegacy->AddProfileFilter(0, L"((RES==;FRT<=30,1;SUT==))");
+                    col->AddProfile(pLegacy.Get());
+                }
+                ComPtr<IMFSensorProfile> pHfr;
+                if (SUCCEEDED(fnCreateProf(KSCAMERAPROFILE_HighFrameRate, 0, nullptr, &pHfr)) && pHfr) {
+                    pHfr->AddProfileFilter(0, L"((RES==;FRT>=60,1;SUT==))");
+                    col->AddProfile(pHfr.Get());
+                }
+                attrs_->SetUnknown(MF_DEVICEMFT_SENSORPROFILE_COLLECTION, col.Get());
+            }
+        }
+        FreeLibrary(mfSensor);
+    }
+
+    hr = MFCreateEventQueue(&eventQueue_);
+    if (FAILED(hr)) return hr;
+
+    stream_.Attach(new PhoneCamMediaStream(this, 0));
+    hr = stream_->Initialize();
+    if (FAILED(hr)) return hr;
 
     ComPtr<IMFStreamDescriptor> sd;
-    hr = MFCreateStreamDescriptor(0, static_cast<DWORD>(types.size()), types.data(), &sd);
-    ComPtr<IMFMediaTypeHandler> handler;
-    if (SUCCEEDED(hr) && SUCCEEDED(sd->GetMediaTypeHandler(&handler))) {
-        handler->SetCurrentMediaType(types[0]);
-    }
-    for (IMFMediaType* t : types) t->Release();
+    hr = stream_->GetStreamDescriptor(&sd);
     if (FAILED(hr)) return hr;
-
-    sd->SetUINT32(MF_DEVICESTREAM_STREAM_ID, 0);
-    sd->SetGUID(MF_DEVICESTREAM_STREAM_CATEGORY, kPinNameVideoCapture);
-    sd->SetUINT32(MF_DEVICESTREAM_FRAMESERVER_SHARED, 1);
-    sd->SetUINT32(MF_DEVICESTREAM_ATTRIBUTE_FRAMESOURCE_TYPES, MFFrameSourceTypes_Color);
 
     IMFStreamDescriptor* sdArr[1] = { sd.Get() };
     hr = MFCreatePresentationDescriptor(1, sdArr, &presDesc_);
     if (FAILED(hr)) return hr;
     presDesc_->SelectStream(0);
 
-    stream_.Attach(new PhoneCamMediaStream(this, sd.Get()));
     return S_OK;
 }
 
@@ -414,10 +589,14 @@ IFACEMETHODIMP PhoneCamMediaSource::QueryInterface(REFIID riid, void** ppv) {
     if (riid == IID_IUnknown || riid == IID_IMFMediaEventGenerator ||
         riid == IID_IMFMediaSource || riid == IID_IMFMediaSourceEx) {
         *ppv = static_cast<IMFMediaSourceEx*>(this);
+    } else if (riid == IID_IMFAttributes) {
+        *ppv = static_cast<IMFAttributes*>(this);
     } else if (riid == IID_IMFGetService) {
         *ppv = static_cast<IMFGetService*>(this);
     } else if (riid == __uuidof(IKsControl)) {
         *ppv = static_cast<IKsControl*>(this);
+    } else if (riid == IID_IMFSampleAllocatorControl) {
+        *ppv = static_cast<IMFSampleAllocatorControl*>(this);
     } else {
         return E_NOINTERFACE;
     }
@@ -434,6 +613,38 @@ IFACEMETHODIMP_(ULONG) PhoneCamMediaSource::Release() {
     if (c == 0) delete this;
     return c;
 }
+
+// IMFAttributes delegation
+IFACEMETHODIMP PhoneCamMediaSource::GetItem(REFGUID guidKey, PROPVARIANT* pValue) { return attrs_->GetItem(guidKey, pValue); }
+IFACEMETHODIMP PhoneCamMediaSource::GetItemType(REFGUID guidKey, MF_ATTRIBUTE_TYPE* pType) { return attrs_->GetItemType(guidKey, pType); }
+IFACEMETHODIMP PhoneCamMediaSource::CompareItem(REFGUID guidKey, REFPROPVARIANT Value, BOOL* pbResult) { return attrs_->CompareItem(guidKey, Value, pbResult); }
+IFACEMETHODIMP PhoneCamMediaSource::Compare(IMFAttributes* pTheirs, MF_ATTRIBUTES_MATCH_TYPE MatchType, BOOL* pbResult) { return attrs_->Compare(pTheirs, MatchType, pbResult); }
+IFACEMETHODIMP PhoneCamMediaSource::GetUINT32(REFGUID guidKey, UINT32* punValue) { return attrs_->GetUINT32(guidKey, punValue); }
+IFACEMETHODIMP PhoneCamMediaSource::GetUINT64(REFGUID guidKey, UINT64* punValue) { return attrs_->GetUINT64(guidKey, punValue); }
+IFACEMETHODIMP PhoneCamMediaSource::GetDouble(REFGUID guidKey, double* pfValue) { return attrs_->GetDouble(guidKey, pfValue); }
+IFACEMETHODIMP PhoneCamMediaSource::GetGUID(REFGUID guidKey, GUID* pguidValue) { return attrs_->GetGUID(guidKey, pguidValue); }
+IFACEMETHODIMP PhoneCamMediaSource::GetStringLength(REFGUID guidKey, UINT32* pcchLength) { return attrs_->GetStringLength(guidKey, pcchLength); }
+IFACEMETHODIMP PhoneCamMediaSource::GetString(REFGUID guidKey, LPWSTR pwszValue, UINT32 cchBufSize, UINT32* pcchLength) { return attrs_->GetString(guidKey, pwszValue, cchBufSize, pcchLength); }
+IFACEMETHODIMP PhoneCamMediaSource::GetAllocatedString(REFGUID guidKey, LPWSTR* ppwszValue, UINT32* pcchLength) { return attrs_->GetAllocatedString(guidKey, ppwszValue, pcchLength); }
+IFACEMETHODIMP PhoneCamMediaSource::GetBlobSize(REFGUID guidKey, UINT32* pcbBlobSize) { return attrs_->GetBlobSize(guidKey, pcbBlobSize); }
+IFACEMETHODIMP PhoneCamMediaSource::GetBlob(REFGUID guidKey, UINT8* pBuf, UINT32 cbBufSize, UINT32* pcbBlobSize) { return attrs_->GetBlob(guidKey, pBuf, cbBufSize, pcbBlobSize); }
+IFACEMETHODIMP PhoneCamMediaSource::GetAllocatedBlob(REFGUID guidKey, UINT8** ppBuf, UINT32* pcbSize) { return attrs_->GetAllocatedBlob(guidKey, ppBuf, pcbSize); }
+IFACEMETHODIMP PhoneCamMediaSource::GetUnknown(REFGUID guidKey, REFIID riid, LPVOID* ppv) { return attrs_->GetUnknown(guidKey, riid, ppv); }
+IFACEMETHODIMP PhoneCamMediaSource::SetItem(REFGUID guidKey, REFPROPVARIANT Value) { return attrs_->SetItem(guidKey, Value); }
+IFACEMETHODIMP PhoneCamMediaSource::DeleteItem(REFGUID guidKey) { return attrs_->DeleteItem(guidKey); }
+IFACEMETHODIMP PhoneCamMediaSource::DeleteAllItems() { return attrs_->DeleteAllItems(); }
+IFACEMETHODIMP PhoneCamMediaSource::SetUINT32(REFGUID guidKey, UINT32 unValue) { return attrs_->SetUINT32(guidKey, unValue); }
+IFACEMETHODIMP PhoneCamMediaSource::SetUINT64(REFGUID guidKey, UINT64 unValue) { return attrs_->SetUINT64(guidKey, unValue); }
+IFACEMETHODIMP PhoneCamMediaSource::SetDouble(REFGUID guidKey, double fValue) { return attrs_->SetDouble(guidKey, fValue); }
+IFACEMETHODIMP PhoneCamMediaSource::SetGUID(REFGUID guidKey, REFGUID guidValue) { return attrs_->SetGUID(guidKey, guidValue); }
+IFACEMETHODIMP PhoneCamMediaSource::SetString(REFGUID guidKey, LPCWSTR wszValue) { return attrs_->SetString(guidKey, wszValue); }
+IFACEMETHODIMP PhoneCamMediaSource::SetBlob(REFGUID guidKey, const UINT8* pBuf, UINT32 cbBufSize) { return attrs_->SetBlob(guidKey, pBuf, cbBufSize); }
+IFACEMETHODIMP PhoneCamMediaSource::SetUnknown(REFGUID guidKey, IUnknown* pUnknown) { return attrs_->SetUnknown(guidKey, pUnknown); }
+IFACEMETHODIMP PhoneCamMediaSource::LockStore() { return attrs_->LockStore(); }
+IFACEMETHODIMP PhoneCamMediaSource::UnlockStore() { return attrs_->UnlockStore(); }
+IFACEMETHODIMP PhoneCamMediaSource::GetCount(UINT32* pcItems) { return attrs_->GetCount(pcItems); }
+IFACEMETHODIMP PhoneCamMediaSource::GetItemByIndex(UINT32 unIndex, GUID* pguidKey, PROPVARIANT* pValue) { return attrs_->GetItemByIndex(unIndex, pguidKey, pValue); }
+IFACEMETHODIMP PhoneCamMediaSource::CopyAllItems(IMFAttributes* pDest) { return attrs_->CopyAllItems(pDest); }
 
 IFACEMETHODIMP PhoneCamMediaSource::GetEvent(DWORD dwFlags, IMFMediaEvent** ppEvent) {
     std::lock_guard<std::mutex> lk(mutex_);
@@ -495,11 +706,11 @@ IFACEMETHODIMP PhoneCamMediaSource::Start(
         }
     }
 
-    PROPVARIANT var{};
-    PropVariantInit(&var);
-    var.vt = VT_UNKNOWN;
-    var.punkVal = static_cast<IMFMediaStream2*>(stream_.Get());
-    eventQueue_->QueueEventParamVar(streamAnnounced_ ? MEUpdatedStream : MENewStream, GUID_NULL, S_OK, &var);
+    eventQueue_->QueueEventParamUnk(
+        streamAnnounced_ ? MEUpdatedStream : MENewStream,
+        GUID_NULL,
+        S_OK,
+        static_cast<IMFMediaStream2*>(stream_.Get()));
     streamAnnounced_ = true;
 
     HRESULT hr = stream_->Start(selectedType.Get(), pvarStartPosition);
@@ -537,16 +748,16 @@ IFACEMETHODIMP PhoneCamMediaSource::Shutdown() {
         eventQueue_.Reset();
     }
     presDesc_.Reset();
-    sourceAttrs_.Reset();
+    attrs_.Reset();
     return S_OK;
 }
 
 IFACEMETHODIMP PhoneCamMediaSource::GetSourceAttributes(IMFAttributes** ppAttributes) {
     if (!ppAttributes) return E_POINTER;
     std::lock_guard<std::mutex> lk(mutex_);
-    if (shutdown_ || !sourceAttrs_) return MF_E_SHUTDOWN;
-    *ppAttributes = sourceAttrs_.Get();
-    (*ppAttributes)->AddRef();
+    if (shutdown_ || !attrs_) return MF_E_SHUTDOWN;
+    *ppAttributes = static_cast<IMFAttributes*>(this);
+    AddRef();
     return S_OK;
 }
 
@@ -555,16 +766,16 @@ IFACEMETHODIMP PhoneCamMediaSource::GetStreamAttributes(DWORD dwStreamIdentifier
     if (dwStreamIdentifier != 0) return MF_E_INVALIDSTREAMNUMBER;
     std::lock_guard<std::mutex> lk(mutex_);
     if (shutdown_ || !stream_) return MF_E_SHUTDOWN;
-    IMFAttributes* attrs = stream_->Attributes();
-    if (!attrs) return E_FAIL;
-    *ppAttributes = attrs;
-    attrs->AddRef();
+    *ppAttributes = static_cast<IMFAttributes*>(stream_.Get());
+    (*ppAttributes)->AddRef();
     return S_OK;
 }
 
-IFACEMETHODIMP PhoneCamMediaSource::SetD3DManager(IUnknown*) {
-    // Intentionally CPU memory sample path for universal WhatsApp/Teams/browser compatibility
-    return S_OK;
+IFACEMETHODIMP PhoneCamMediaSource::SetD3DManager(IUnknown* pManager) {
+    if (!pManager) return E_POINTER;
+    std::lock_guard<std::mutex> lk(mutex_);
+    if (shutdown_ || !stream_) return MF_E_SHUTDOWN;
+    return stream_->SetD3DManager(pManager);
 }
 
 IFACEMETHODIMP PhoneCamMediaSource::GetService(REFGUID, REFIID riid, LPVOID* ppvObject) {
@@ -591,6 +802,24 @@ IFACEMETHODIMP PhoneCamMediaSource::KsEvent(PKSEVENT, ULONG, LPVOID, ULONG, ULON
     return HRESULT_FROM_WIN32(ERROR_SET_NOT_FOUND);
 }
 
+IFACEMETHODIMP PhoneCamMediaSource::SetDefaultAllocator(DWORD dwOutputStreamID, IUnknown* pAllocator) {
+    if (!pAllocator) return E_POINTER;
+    if (dwOutputStreamID != 0) return MF_E_INVALIDSTREAMNUMBER;
+    std::lock_guard<std::mutex> lk(mutex_);
+    if (shutdown_ || !stream_) return MF_E_SHUTDOWN;
+    return stream_->SetAllocator(pAllocator);
+}
+
+IFACEMETHODIMP PhoneCamMediaSource::GetAllocatorUsage(DWORD dwOutputStreamID, DWORD* pdwInputStreamID, MFSampleAllocatorUsage* peUsage) {
+    if (!pdwInputStreamID || !peUsage) return E_POINTER;
+    if (dwOutputStreamID != 0) return MF_E_INVALIDSTREAMNUMBER;
+    std::lock_guard<std::mutex> lk(mutex_);
+    if (shutdown_ || !stream_) return MF_E_SHUTDOWN;
+    *pdwInputStreamID = dwOutputStreamID;
+    *peUsage = stream_->GetAllocatorUsage();
+    return S_OK;
+}
+
 // ============================================================================
 // PhoneCamActivator
 // ============================================================================
@@ -606,7 +835,11 @@ HRESULT PhoneCamActivator::CreateInstance(REFIID riid, void** ppv) {
 
 PhoneCamActivator::PhoneCamActivator() {
     IncrementModuleRef();
-    MFCreateAttributes(&attrs_, 4);
+    MFCreateAttributes(&attrs_, 8);
+    if (attrs_) {
+        attrs_->SetUINT32(MF_VIRTUALCAMERA_PROVIDE_ASSOCIATED_CAMERA_SOURCES, 1);
+        attrs_->SetGUID(MFT_TRANSFORM_CLSID_Attribute, CLSID_PhoneCamMFActivator);
+    }
 }
 
 PhoneCamActivator::~PhoneCamActivator() {
@@ -670,7 +903,7 @@ IFACEMETHODIMP PhoneCamActivator::ActivateObject(REFIID riid, void** ppv) {
     if (!ppv) return E_POINTER;
     std::lock_guard<std::mutex> lk(mutex_);
     if (!source_) {
-        HRESULT hr = PhoneCamMediaSource::CreateInstance(&source_);
+        HRESULT hr = PhoneCamMediaSource::CreateInstance(static_cast<IMFAttributes*>(this), &source_);
         if (FAILED(hr)) return hr;
     }
     return source_->QueryInterface(riid, ppv);
